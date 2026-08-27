@@ -1,18 +1,15 @@
-const { Groq } = require("groq-sdk");
+// src/services/ai.service.js
 const BaseService = require('./base.service');
+const YaneIntegrationService = require('./yane-integration.service');
 
 class AIService extends BaseService {
   constructor() {
     super();
-    this.groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    this.yane = new YaneIntegrationService();
     this.cache = new Map();
+    this.defaultModel = 'deepseek-chat';
   }
 
-  /**
-   * @param {string} prompt
-   * @param {string} systemPrompt
-   * @returns {Promise<string>}
-   */
   async generateResponse(prompt, systemPrompt) {
     try {
       const cacheKey = `${prompt}_${systemPrompt}`;
@@ -20,30 +17,38 @@ class AIService extends BaseService {
         return this.cache.get(cacheKey);
       }
 
-      const completion = await this.groq.chat.completions.create({
-        messages: [
-          { 
-            role: "system", 
-            content: `${systemPrompt}
-            Important: Never include translations or English text in parentheses.
-            Respond naturally in Bahasa Indonesia only.` 
-          },
-          { role: "user", content: prompt }
-        ],
-        model: "mixtral-8x7b-32768",
-        temperature: 0.7,
-        max_tokens: 512,
-        stream: false
-      });
+      const messages = [];
+      if (systemPrompt) {
+        messages.push({ role: 'system', content: systemPrompt });
+      }
+      messages.push({ role: 'user', content: prompt });
 
-      const response = completion.choices[0]?.message?.content;
-      this.cache.set(cacheKey, response);
+      const response = await this.yane.callAI(messages, this.defaultModel, 0.7);
+      
+      // Cache apenas se a resposta for válida
+      if (response && response.length > 10) {
+        this.cache.set(cacheKey, response);
+        // Limitar cache a 100 entradas
+        if (this.cache.size > 100) {
+          const firstKey = this.cache.keys().next().value;
+          this.cache.delete(firstKey);
+        }
+      }
       
       return response;
     } catch (error) {
+      console.error('[AI] Erro ao gerar resposta:', error.message);
       throw this.handleError(error, 'AI Service');
     }
   }
+
+  /**
+   * Limpa o cache
+   */
+  clearCache() {
+    this.cache.clear();
+    console.log('[AI] Cache limpo');
+  }
 }
 
-module.exports = AIService; 
+module.exports = AIService;

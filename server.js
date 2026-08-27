@@ -12,7 +12,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // Start server
-app.listen(port, () => {
+app.listen(port, async () => {
   console.log(`Server running on port ${port}`);
-  whatsappService.initialize();
-}); 
+  await whatsappService.initialize();
+});

@@ -1,10 +1,12 @@
 {
   "dependencies": {
+    "@adiwajshing/keyed-db": "^0.2.4",
+    "@whiskeysockets/baileys": "^6.7.10",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "googleapis": "^144.0.0",
     "groq-sdk": "^0.13.0",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.26.0"
+    "pino": "^10.3.1",
+    "qrcode-terminal": "^0.12.0"
   }
 }

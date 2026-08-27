@@ -14,4 +14,4 @@ class BaseService {
   }
 }
 
-module.exports = BaseService; 
+module.exports = BaseService;
