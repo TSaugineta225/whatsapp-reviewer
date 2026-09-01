@@ -1,36 +1,147 @@
 // src/services/whatsapp.service.js
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
+
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeInMemoryStore,
+} = require('@whiskeysockets/baileys');
+
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
+
 const BaseService = require('./base.service');
 
 const AUTH_DIR = path.join(__dirname, '../../auth_info');
 
-// ============================================================
-// CLASSE PRINCIPAL
-// ============================================================
+const DEFAULT_API_URL = 'http://localhost:8000/api';
+const DEFAULT_COUNTRY_CODE = '258';
+
+const MAX_RETRIES = 5;
+const INITIAL_RETRY_DELAY = 5000;
+const CONNECTION_TIMEOUT = 60000;
+const READ_STATUS_DEBOUNCE = 5000;
+
+const STATUS_BROADCAST = 'status@broadcast';
+const WHATSAPP_SUFFIX = '@s.whatsapp.net';
+const GROUP_SUFFIX = '@g.us';
 
 class WhatsAppService extends BaseService {
   constructor(interviewService) {
     super();
-    this.interviewService = interviewService;
-    this.socket = null;
-    this.isReady = false;
-    this.qrCode = null;
-    this.store = null;
-    this.retryCount = 0;
-    this.maxRetries = 5;
-    this.isConnecting = false;
-    this.yaneApiUrl = process.env.YANE_API_URL || 'http://localhost:8000/api';
-    this.lastReadTimestamps = {};
 
-    if (!fs.existsSync(AUTH_DIR)) {
-      fs.mkdirSync(AUTH_DIR, { recursive: true });
+    if (!interviewService) {
+      throw new Error('WhatsAppService requer uma instância de interviewService.');
     }
+
+    this.interviewService = interviewService;
+
+    // Estado da conexão
+    this.socket = null;
+    this.store = null;
+    this.isReady = false;
+    this.isConnecting = false;
+    this.retryCount = 0;
+    this.retryTimer = null;
+
+    // QR Code
+    this.qrCode = null;
+
+    // Configuração
+    this.yaneApiUrl = (
+      process.env.YANE_API_URL || DEFAULT_API_URL
+    ).replace(/\/+$/, '');
+
+    this.defaultCountryCode =
+      process.env.DEFAULT_COUNTRY_CODE || DEFAULT_COUNTRY_CODE;
+
+    // Controle de eventos
+    this.lastReadTimestamps = new Map();
+
+    // Logger silencioso para Baileys
     this.logger = pino({ level: 'silent' });
+
+    this.ensureAuthDirectory();
+  }
+
+  // ============================================================
+  // CONFIGURAÇÃO
+  // ============================================================
+
+  ensureAuthDirectory() {
+    try {
+      if (!fs.existsSync(AUTH_DIR)) {
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+      }
+    } catch (error) {
+      this.logError('Não foi possível criar o diretório de autenticação.', error);
+      throw error;
+    }
+  }
+
+  // ============================================================
+  // NORMALIZAÇÃO DE TELEFONE
+  // ============================================================
+
+  normalizePhone(phone) {
+    if (!phone) {
+      return '';
+    }
+
+    let clean = String(phone)
+      .split('@')[0]
+      .split(':')[0]
+      .replace(/\D/g, '');
+
+    if (!clean) {
+      return '';
+    }
+
+    // Exemplo:
+    // 841234567 -> 258841234567
+    if (clean.length === 9) {
+      clean = `${this.defaultCountryCode}${clean}`;
+    }
+
+    // Exemplo:
+    // 0841234567 -> 258841234567
+    else if (
+      clean.length === 10 &&
+      clean.startsWith('0')
+    ) {
+      clean = `${this.defaultCountryCode}${clean.slice(1)}`;
+    }
+
+    return clean;
+  }
+
+  getChatId(to) {
+    if (!to) {
+      return '';
+    }
+
+    const value = String(to).trim();
+
+    // Grupo
+    if (value.endsWith(GROUP_SUFFIX)) {
+      return value;
+    }
+
+    // JID já normalizado
+    if (value.endsWith(WHATSAPP_SUFFIX)) {
+      return value;
+    }
+
+    const phone = this.normalizePhone(value);
+
+    if (!phone) {
+      return '';
+    }
+
+    return `${phone}${WHATSAPP_SUFFIX}`;
   }
 
   // ============================================================
@@ -38,45 +149,57 @@ class WhatsAppService extends BaseService {
   // ============================================================
 
   async initialize() {
-    if (this.isConnecting) return;
+    if (this.isConnecting) {
+      this.log('Conexão já está em processo de inicialização.');
+      return;
+    }
+
+    this.clearRetryTimer();
+
     this.isConnecting = true;
-    console.log('[BOT] Iniciando conexão com WhatsApp (Baileys)...');
+    this.isReady = false;
+
+    this.log('Iniciando conexão com WhatsApp via Baileys...');
 
     try {
+      this.ensureAuthDirectory();
+
       const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+
       const { version } = await fetchLatestBaileysVersion();
 
       this.socket = makeWASocket({
         version,
         auth: state,
         logger: this.logger,
+
         browser: ['Yane ATS', 'Chrome', '120.0.0.0'],
+
         printQRInTerminal: false,
         syncFullHistory: false,
         markOnlineOnConnect: true,
         generateHighQualityLinkPreview: false,
-        defaultQueryTimeoutMs: 60000,
+
+        defaultQueryTimeoutMs: CONNECTION_TIMEOUT,
       });
 
-      this.store = makeInMemoryStore({ logger: this.logger });
+      this.store = makeInMemoryStore({
+        logger: this.logger,
+      });
+
       this.store.bind(this.socket.ev);
+
       this.setupEventHandlers(saveCreds);
 
-      await this.socket.waitForConnectionUpdate(
-        (update) => update.connection === 'open' || update.connection === 'close'
-      );
+      this.log('Socket WhatsApp criado. Aguardando conexão...');
 
-      console.log('[BOT] Conexão inicializada com sucesso');
-      this.isConnecting = false;
     } catch (error) {
-      console.error('[BOT] Erro ao inicializar:', error.message);
       this.isConnecting = false;
       this.isReady = false;
-      if (this.retryCount < this.maxRetries) {
-        this.retryCount++;
-        console.log(`[BOT] Tentativa ${this.retryCount}/${this.maxRetries} em 10s...`);
-        setTimeout(() => this.initialize(), 10000);
-      }
+
+      this.logError('Erro ao inicializar WhatsApp.', error);
+
+      this.scheduleReconnect();
     }
   }
 
@@ -85,245 +208,884 @@ class WhatsAppService extends BaseService {
   // ============================================================
 
   setupEventHandlers(saveCreds) {
-    // 1. Connection updates (QR, open, close)
-    this.socket.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+    if (!this.socket) {
+      throw new Error('Socket WhatsApp não inicializado.');
+    }
 
-      if (qr) {
-        console.log('[QR CODE] Digitalize com o seu WhatsApp:');
-        qrcode.generate(qr, { small: true });
-        this.qrCode = qr;
-        global.qrCode = qr;
-        this.isReady = false;
-      }
+    this.socket.ev.on(
+      'connection.update',
+      (update) => this.handleConnectionUpdate(update)
+    );
 
-      if (connection === 'open') {
-        console.log('[OK] WhatsApp conectado e pronto a responder!');
-        this.isReady = true;
-        this.qrCode = null;
-        global.qrCode = null;
-        this.retryCount = 0;
-        this.isConnecting = false;
-        console.log(`[BOT] Conectado como: ${this.socket.user?.name} (${this.socket.user?.id})`);
-      }
+    this.socket.ev.on(
+      'creds.update',
+      saveCreds
+    );
 
-      if (connection === 'close') {
-        const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`[DESCONECTADO] Código: ${statusCode} - Reconectar: ${shouldReconnect}`);
-        this.isReady = false;
-        this.qrCode = null;
-        global.qrCode = null;
+    this.socket.ev.on(
+      'messages.upsert',
+      (event) => this.handleMessagesUpsert(event)
+    );
 
-        if (shouldReconnect && this.retryCount < this.maxRetries) {
-          this.retryCount++;
-          console.log(`[BOT] Tentativa ${this.retryCount}/${this.maxRetries} em 5s...`);
-          setTimeout(() => this.initialize(), 5000);
-        } else if (statusCode === DisconnectReason.loggedOut) {
-          console.log('[BOT] Sessão expirada. Remova a pasta auth_info e reinicie.');
-          if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        }
-      }
-    });
+    this.socket.ev.on(
+      'messages.update',
+      (updates) => this.handleMessagesUpdate(updates)
+    );
 
-    // 2. Credentials update
-    this.socket.ev.on('creds.update', saveCreds);
-
-    // ============================================================
-    // 3. MENSAGENS (recebimento e interações com botões)
-    // ============================================================
-    this.socket.ev.on('messages.upsert', async (m) => {
-      try {
-        const msg = m.messages[0];
-        if (!msg || !msg.message) return;
-        if (msg.key.fromMe) return;
-        if (msg.key.remoteJid === 'status@broadcast') return;
-
-        const from = msg.key.remoteJid;
-        let text = '';
-        let isButtonClick = false;
-
-        // 3A. Mensagem de texto normal
-        if (msg.message.conversation) {
-          text = msg.message.conversation;
-        } else if (msg.message.extendedTextMessage?.text) {
-          text = msg.message.extendedTextMessage.text;
-        }
-        // 3B. Resposta a botões interativos (Baileys)
-        else if (msg.message.interactiveResponseMessage) {
-          const response = msg.message.interactiveResponseMessage;
-          if (response.nativeFlowResponseMessage) {
-            text = response.nativeFlowResponseMessage?.text || '';
-            isButtonClick = true;
-          } else if (response.selectedButton) {
-            text = response.selectedButton?.displayText || '';
-            isButtonClick = true;
-          }
-        }
-        // 3C. Resposta a botões (legado)
-        else if (msg.message.buttonsResponseMessage) {
-          const btn = msg.message.buttonsResponseMessage;
-          text = btn.selectedButtonId || btn.displayText || '';
-          isButtonClick = true;
-        }
-
-        if (!text && !isButtonClick) {
-          return;
-        }
-
-        console.log(`[MENSAGEM] De [${from}]: "${text.substring(0, 100)}${text.length > 100 ? '...' : ''}"`);
-
-        await this.handleMessage(from, text, isButtonClick);
-
-      } catch (error) {
-        console.error('[BOT] Erro ao processar mensagem:', error.message);
-      }
-    });
-
-    // ============================================================
-    // 4. STATUS DE LEITURA (Read Receipts)
-    // ============================================================
-    this.socket.ev.on('messages.update', async (updates) => {
-      for (const update of updates) {
-        if (update.status === 'read' && update.key) {
-          const from = update.key.remoteJid;
-          const messageId = update.key.id;
-          
-          // Evitar duplicados
-          const now = Date.now();
-          if (this.lastReadTimestamps[from] && (now - this.lastReadTimestamps[from] < 5000)) {
-            continue;
-          }
-          this.lastReadTimestamps[from] = now;
-
-          console.log(`[LEITURA] Mensagem ${messageId} lida por ${from}`);
-
-          // Notificar a Yane (backend) sobre a leitura
-          try {
-            const response = await fetch(`${this.yaneApiUrl}/webhooks/message-status`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                phone: from,
-                message_id: messageId,
-                status: 'read',
-                timestamp: new Date().toISOString()
-              })
-            });
-            if (!response.ok) {
-              console.error('[LEITURA] Erro ao notificar backend:', response.status);
-            }
-          } catch (err) {
-            console.error('[LEITURA] Erro ao enviar status:', err.message);
-          }
-        }
-      }
-    });
-
-    // 5. Presença (opcional)
-    this.socket.ev.on('presence.update', () => {});
+    this.socket.ev.on(
+      'presence.update',
+      () => {}
+    );
   }
 
   // ============================================================
-  // ENVIAR MENSAGEM COM BOTÕES INTERATIVOS (NOVO)
+  // CONNECTION UPDATE
   // ============================================================
 
-  async sendInteractiveMessage(to, title, body, buttons = []) {
+  async handleConnectionUpdate(update) {
+    const {
+      connection,
+      lastDisconnect,
+      qr,
+    } = update;
+
+    if (qr) {
+      this.handleQRCode(qr);
+    }
+
+    if (connection === 'open') {
+      this.handleConnectionOpen();
+      return;
+    }
+
+    if (connection === 'close') {
+      await this.handleConnectionClose(lastDisconnect);
+    }
+  }
+
+  handleQRCode(qr) {
+    this.qrCode = qr;
+    this.isReady = false;
+
+    console.log('\n[QR CODE] Digitalize com o seu WhatsApp:\n');
+
+    qrcode.generate(qr, {
+      small: true,
+    });
+  }
+
+  handleConnectionOpen() {
+    this.isReady = true;
+    this.isConnecting = false;
+    this.qrCode = null;
+    this.retryCount = 0;
+
+    this.clearRetryTimer();
+
+    const user = this.socket?.user;
+
+    this.log('WhatsApp conectado e pronto para responder.');
+
+    if (user) {
+      this.log(
+        `Sessão: ${user.name || 'WhatsApp'} (${user.id || 'desconhecido'})`
+      );
+    }
+  }
+
+  async handleConnectionClose(lastDisconnect) {
+    const statusCode = this.getDisconnectStatusCode(lastDisconnect);
+
+    const loggedOut =
+      statusCode === DisconnectReason.loggedOut;
+
+    this.isReady = false;
+    this.isConnecting = false;
+    this.qrCode = null;
+
+    this.log(
+      `WhatsApp desconectado. Código: ${statusCode || 'desconhecido'}`
+    );
+
+    if (loggedOut) {
+      this.log(
+        'Sessão encerrada pelo WhatsApp. Limpando credenciais locais.'
+      );
+
+      this.clearAuthDirectory();
+      return;
+    }
+
+    this.scheduleReconnect();
+  }
+
+  getDisconnectStatusCode(lastDisconnect) {
+    return (
+      lastDisconnect?.error?.output?.statusCode ||
+      lastDisconnect?.error?.statusCode ||
+      null
+    );
+  }
+
+  // ============================================================
+  // RECONEXÃO
+  // ============================================================
+
+  scheduleReconnect() {
+    if (this.retryTimer) {
+      return;
+    }
+
+    if (this.retryCount >= MAX_RETRIES) {
+      this.logError(
+        `Número máximo de tentativas atingido (${MAX_RETRIES}).`
+      );
+      return;
+    }
+
+    this.retryCount += 1;
+
+    const delay =
+      this.retryCount === 1
+        ? INITIAL_RETRY_DELAY
+        : INITIAL_RETRY_DELAY * this.retryCount;
+
+    this.log(
+      `Reconexão ${this.retryCount}/${MAX_RETRIES} em ${Math.round(delay / 1000)}s...`
+    );
+
+    this.retryTimer = setTimeout(async () => {
+      this.retryTimer = null;
+
+      try {
+        await this.initialize();
+      } catch (error) {
+        this.logError('Falha durante tentativa de reconexão.', error);
+      }
+    }, delay);
+  }
+
+  clearRetryTimer() {
+    if (!this.retryTimer) {
+      return;
+    }
+
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
+  // ============================================================
+  // MENSAGENS RECEBIDAS
+  // ============================================================
+
+  async handleMessagesUpsert(event) {
     try {
-      if (!this.isReady || !this.socket) {
-        console.log('[BOT] WhatsApp não está pronto.');
-        return false;
+      const messages = event?.messages || [];
+
+      for (const message of messages) {
+        await this.processIncomingMessage(message);
+      }
+    } catch (error) {
+      this.logError(
+        'Erro ao processar lote de mensagens.',
+        error
+      );
+    }
+  }
+
+  async processIncomingMessage(msg) {
+    if (!msg?.message) {
+      return;
+    }
+
+    if (msg.key?.fromMe) {
+      return;
+    }
+
+    const from = msg.key?.remoteJid;
+
+    if (!from || from === STATUS_BROADCAST) {
+      return;
+    }
+
+    const parsed = this.extractMessageContent(msg);
+
+    if (!parsed.text && !parsed.isButtonClick) {
+      return;
+    }
+
+    const preview = parsed.text.length > 100
+      ? `${parsed.text.substring(0, 100)}...`
+      : parsed.text;
+
+    this.log(
+      `Mensagem recebida de [${from}]: "${preview}"`
+    );
+
+    await this.handleMessage(
+      from,
+      parsed.text,
+      parsed.isButtonClick
+    );
+  }
+
+  // ============================================================
+  // EXTRAÇÃO DO CONTEÚDO
+  // ============================================================
+
+  extractMessageContent(msg) {
+    const message = msg.message;
+
+    // Texto simples
+    if (message.conversation) {
+      return {
+        text: message.conversation.trim(),
+        isButtonClick: false,
+      };
+    }
+
+    // Texto expandido
+    if (message.extendedTextMessage?.text) {
+      return {
+        text: message.extendedTextMessage.text.trim(),
+        isButtonClick: false,
+      };
+    }
+
+    // Resposta interativa
+    if (message.interactiveResponseMessage) {
+      return this.extractInteractiveResponse(
+        message.interactiveResponseMessage
+      );
+    }
+
+    // Botões legados
+    if (message.buttonsResponseMessage) {
+      const response = message.buttonsResponseMessage;
+
+      return {
+        text: (
+          response.selectedButtonId ||
+          response.displayText ||
+          ''
+        ).trim(),
+
+        isButtonClick: true,
+      };
+    }
+
+    return {
+      text: '',
+      isButtonClick: false,
+    };
+  }
+
+  extractInteractiveResponse(response) {
+    const nativeFlow = response?.nativeFlowResponseMessage;
+
+    if (nativeFlow) {
+      return {
+        text: (
+          nativeFlow.text ||
+          nativeFlow.paramsJson ||
+          ''
+        ).trim(),
+
+        isButtonClick: true,
+      };
+    }
+
+    const selectedButton = response?.selectedButton;
+
+    if (selectedButton) {
+      return {
+        text: (
+          selectedButton.displayText ||
+          selectedButton.id ||
+          ''
+        ).trim(),
+
+        isButtonClick: true,
+      };
+    }
+
+    return {
+      text: '',
+      isButtonClick: false,
+    };
+  }
+
+  // ============================================================
+  // STATUS DE LEITURA
+  // ============================================================
+
+  async handleMessagesUpdate(updates = []) {
+    for (const update of updates) {
+      if (update?.status !== 'read') {
+        continue;
       }
 
-      const chatId = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+      const key = update.key;
 
-      // Estrutura padrão para botões interativos (Baileys)
-      const interactiveButtons = buttons.map((btn, idx) => ({
-        id: btn.id || `btn_${idx}`,
-        text: btn.text || btn.label || `Opção ${idx + 1}`,
-        type: 'reply'
-      }));
+      if (!key?.remoteJid || !key?.id) {
+        continue;
+      }
 
-      await this.socket.sendMessage(chatId, {
-        interactive: {
-          header: title ? { title: title } : undefined,
-          body: { text: body },
-          footer: { text: 'Yane ATS - Recrutamento Inteligente' },
-          action: {
-            buttons: interactiveButtons
-          }
-        }
-      });
+      await this.handleReadReceipt(key);
+    }
+  }
 
-      console.log(`[BOT] Mensagem com botões enviada para ${to}`);
-      return true;
-    } catch (error) {
-      console.error(`[BOT] Erro ao enviar mensagem com botões para ${to}:`, error.message);
+  async handleReadReceipt(key) {
+    const from = key.remoteJid;
+    const messageId = key.id;
+
+    if (this.isReadReceiptDebounced(from)) {
+      return;
+    }
+
+    this.lastReadTimestamps.set(
+      from,
+      Date.now()
+    );
+
+    this.log(
+      `Mensagem ${messageId} lida por ${from}`
+    );
+
+    await this.notifyBackendMessageRead({
+      phone: from,
+      messageId,
+    });
+  }
+
+  isReadReceiptDebounced(phone) {
+    const lastRead = this.lastReadTimestamps.get(phone);
+
+    if (!lastRead) {
       return false;
+    }
+
+    return (
+      Date.now() - lastRead <
+      READ_STATUS_DEBOUNCE
+    );
+  }
+
+  async notifyBackendMessageRead({
+    phone,
+    messageId,
+  }) {
+    try {
+      const response = await fetch(
+        `${this.yaneApiUrl}/webhooks/message-status`,
+        {
+          method: 'POST',
+
+          headers: {
+            'Content-Type': 'application/json',
+          },
+
+          body: JSON.stringify({
+            phone,
+            message_id: messageId,
+            status: 'read',
+            timestamp: new Date().toISOString(),
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        this.logError(
+          `Backend rejeitou status de leitura. HTTP ${response.status}`
+        );
+      }
+    } catch (error) {
+      this.logError(
+        'Erro ao enviar status de leitura para o backend.',
+        error
+      );
     }
   }
 
   // ============================================================
-  // ENVIAR MENSAGEM DE TEXTO SIMPLES
+  // ENVIO DE MENSAGEM
   // ============================================================
 
   async sendMessage(to, message) {
+    if (!message) {
+      this.logError('Tentativa de enviar mensagem vazia.');
+      return false;
+    }
+
+    const chatId = this.prepareChatId(to);
+
+    if (!chatId) {
+      return false;
+    }
+
+    if (!this.ensureReady()) {
+      return false;
+    }
+
     try {
-      if (!this.isReady || !this.socket) {
-        console.log('[BOT] WhatsApp não está pronto.');
-        return false;
-      }
-      const chatId = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-      await this.socket.sendMessage(chatId, { text: message });
-      console.log(`[BOT] Mensagem enviada para ${to}`);
+      await this.socket.sendMessage(
+        chatId,
+        {
+          text: String(message),
+        }
+      );
+
+      this.log(
+        `Mensagem enviada para +${chatId.split('@')[0]}`
+      );
+
       return true;
     } catch (error) {
-      console.error(`[BOT] Erro ao enviar mensagem para ${to}:`, error.message);
+      this.logError(
+        `Erro ao enviar mensagem para ${to}.`,
+        error
+      );
+
       return false;
     }
   }
 
   // ============================================================
-  // PROCESSAMENTO DE MENSAGENS
+  // MENSAGEM INTERATIVA
   // ============================================================
 
-  async handleMessage(from, text, isButton = false) {
+  async sendInteractiveMessage(
+    to,
+    title,
+    body,
+    buttons = []
+  ) {
+    const chatId = this.prepareChatId(to);
+
+    if (!chatId) {
+      return false;
+    }
+
+    if (!this.ensureReady()) {
+      return false;
+    }
+
+    if (!body) {
+      this.logError(
+        'Mensagem interativa sem conteúdo.'
+      );
+
+      return false;
+    }
+
     try {
-      const userId = from;
-      const hasActiveSession = !!this.interviewService.getSession(userId);
+      const interactiveButtons =
+        this.buildInteractiveButtons(buttons);
 
-      // Comando de reset
-      if (text.toLowerCase().trim() === '!reset' || text.toLowerCase().trim() === '!recomencar') {
-        this.interviewService.endSession(userId);
-        await this.sendMessage(from, "Sessão reiniciada! Envie START ou OLÁ para começar novamente.");
+      if (!interactiveButtons.length) {
+        return this.sendMessage(to, body);
+      }
+
+      await this.socket.sendMessage(
+        chatId,
+        {
+          interactive: {
+            header: title
+              ? {
+                  title: String(title),
+                }
+              : undefined,
+
+            body: {
+              text: String(body),
+            },
+
+            footer: {
+              text:
+                'Yane ATS - Recrutamento Inteligente',
+            },
+
+            action: {
+              buttons: interactiveButtons,
+            },
+          },
+        }
+      );
+
+      this.log(
+        `Mensagem interativa enviada para +${chatId.split('@')[0]}`
+      );
+
+      return true;
+    } catch (error) {
+      this.logError(
+        `Erro ao enviar mensagem interativa para ${to}.`,
+        error
+      );
+
+      return false;
+    }
+  }
+
+  buildInteractiveButtons(buttons) {
+    if (!Array.isArray(buttons)) {
+      return [];
+    }
+
+    return buttons
+      .filter(Boolean)
+      .map((button, index) => ({
+        id:
+          button.id ||
+          `btn_${index + 1}`,
+
+        text:
+          button.text ||
+          button.label ||
+          `Opção ${index + 1}`,
+
+        type: 'reply',
+      }));
+  }
+
+  // ============================================================
+  // PROCESSAMENTO DA CONVERSA
+  // ============================================================
+
+  async handleMessage(
+    from,
+    text,
+    isButton = false
+  ) {
+    if (!from) {
+      return;
+    }
+
+    const normalizedText =
+      String(text || '').trim();
+
+    try {
+      const hasActiveSession =
+        !!this.interviewService.getSession(from);
+
+      // --------------------------------------------------------
+      // RESET
+      // --------------------------------------------------------
+
+      if (this.isResetCommand(normalizedText)) {
+        this.interviewService.endSession(from);
+
+        await this.sendMessage(
+          from,
+          'Sessão reiniciada! Envie START ou OLÁ para começar novamente.'
+        );
+
         return;
       }
 
-      // Se for clique em botão "Iniciar" ou texto de trigger
-      const isStart = this.isStartTrigger(text) || text === 'iniciar' || text === 'start' || isButton;
+      // --------------------------------------------------------
+      // INÍCIO DA ENTREVISTA
+      // --------------------------------------------------------
 
-      if (!hasActiveSession && isStart) {
-        console.log(`[SESSAO] A iniciar entrevista para ${userId}...`);
-        const welcome = await this.interviewService.startInterview(userId);
-        await this.sendMessage(from, welcome);
+      if (
+        !hasActiveSession &&
+        this.isStartTrigger(normalizedText, isButton)
+      ) {
+        this.log(
+          `[SESSAO] A iniciar entrevista para ${from}...`
+        );
+
+        const welcome =
+          await this.interviewService.startInterview(from);
+
+        if (welcome) {
+          await this.sendMessage(
+            from,
+            welcome
+          );
+        }
+
         return;
       }
+
+      // --------------------------------------------------------
+      // SESSÃO ATIVA
+      // --------------------------------------------------------
 
       if (hasActiveSession) {
-        console.log(`[SESSAO] A processar resposta para ${userId}...`);
-        const response = await this.interviewService.handleResponse(userId, text);
+        this.log(
+          `[SESSAO] A processar resposta para ${from}...`
+        );
+
+        const response =
+          await this.interviewService.handleResponse(
+            from,
+            normalizedText
+          );
+
         if (response) {
-          await this.sendMessage(from, response);
+          await this.sendMessage(
+            from,
+            response
+          );
         }
+
         return;
       }
 
-      // Se não tiver sessão e não for trigger, ignorar
-      console.log(`[BOT] Ignorando mensagem de ${userId} (sem sessão)`);
+      // --------------------------------------------------------
+      // SEM SESSÃO
+      // --------------------------------------------------------
 
+      this.log(
+        `[BOT] Mensagem ignorada de ${from}: nenhuma sessão ativa.`
+      );
     } catch (error) {
-      console.error('[BOT] Erro ao processar mensagem:', error.message);
-      await this.sendMessage(from, "Desculpe, ocorreu um erro. Tente novamente dentro de momentos.");
+      this.logError(
+        `Erro ao processar mensagem de ${from}.`,
+        error
+      );
+
+      await this.sendMessage(
+        from,
+        'Desculpe, ocorreu um erro. Tente novamente dentro de momentos.'
+      );
+    }
+  }
+
+  isResetCommand(text) {
+    const normalized =
+      String(text || '')
+        .toLowerCase()
+        .trim();
+
+    return (
+      normalized === '!reset' ||
+      normalized === '!recomencar' ||
+      normalized === '!recomeçar'
+    );
+  }
+
+  // ============================================================
+  // TRIGGERS
+  // ============================================================
+
+  isStartTrigger(text, isButton = false) {
+    if (isButton) {
+      return this.isExplicitStartText(text);
+    }
+
+    if (!text) {
+      return false;
+    }
+
+    const cleanText =
+      text
+        .toLowerCase()
+        .trim();
+
+    const triggers = [
+      /^sim\b/,
+      /^oi\b/,
+      /^ol[aá]\b/,
+      /^iniciar\b/,
+      /^start\b/,
+      /^menu\b/,
+      /^entrevista\b/,
+      /^bom dia\b/,
+      /^boa tarde\b/,
+      /^boa noite\b/,
+      /^vaga\b/,
+      /^gostaria\b/,
+      /^quero\b/,
+      /^pode começar\b/,
+      /^pode comecar\b/,
+      /^começar\b/,
+      /^comecar\b/,
+    ];
+
+    return triggers.some(
+      (regex) => regex.test(cleanText)
+    );
+  }
+
+  isExplicitStartText(text) {
+    if (!text) {
+      return false;
+    }
+
+    const cleanText =
+      text
+        .toLowerCase()
+        .trim();
+
+    return [
+      'iniciar',
+      'start',
+      'começar',
+      'comecar',
+      'iniciar entrevista',
+      'começar entrevista',
+      'comecar entrevista',
+    ].includes(cleanText);
+  }
+
+  // ============================================================
+  // ESTADO
+  // ============================================================
+
+  getStatus() {
+    const connected =
+      Boolean(
+        this.isReady &&
+        this.socket?.user?.id
+      );
+
+    return {
+      connected,
+
+      qr_code:
+        this.qrCode,
+
+      session:
+        this.socket?.user?.id
+          ?.split(':')[0] ||
+        null,
+
+      message:
+        connected
+          ? 'WhatsApp conectado e pronto'
+          : this.qrCode
+            ? 'Aguardando escaneamento do QR Code'
+            : this.isConnecting
+              ? 'A iniciar sessão...'
+              : 'WhatsApp desconectado',
+    };
+  }
+
+  ensureReady() {
+    if (
+      !this.isReady ||
+      !this.socket
+    ) {
+      this.log(
+        'WhatsApp não está pronto para enviar mensagens.'
+      );
+
+      return false;
+    }
+
+    return true;
+  }
+
+  prepareChatId(to) {
+    const chatId =
+      this.getChatId(to);
+
+    if (!chatId) {
+      this.logError(
+        `Número/JID inválido: ${to}`
+      );
+
+      return '';
+    }
+
+    return chatId;
+  }
+
+  // ============================================================
+  // RESET DA SESSÃO
+  // ============================================================
+
+  async resetSession() {
+    if (this.isConnecting) {
+      return {
+        success: false,
+        message:
+          'Já existe uma operação de conexão em andamento.',
+      };
+    }
+
+    this.isConnecting = true;
+
+    try {
+      this.clearRetryTimer();
+
+      await this.closeSocket();
+
+      this.resetConnectionState();
+
+      this.clearAuthDirectory();
+      this.ensureAuthDirectory();
+
+      await this.delay(2000);
+
+      this.isConnecting = false;
+
+      await this.initialize();
+
+      return {
+        success: true,
+        message: 'Sessão reiniciada. Aguarde o novo QR Code.',
+      };
+    } catch (error) {
+      this.isConnecting = false;
+
+      this.logError(
+        'Erro ao reiniciar sessão do WhatsApp.',
+        error
+      );
+
+      return {
+        success: false,
+        message: error.message,
+      };
+    }
+  }
+
+  async closeSocket() {
+    if (!this.socket) {
+      return;
+    }
+
+    try {
+      if (this.socket.ws) {
+        this.socket.ws.close();
+      }
+    } catch (error) {
+      this.logError(
+        'Erro ao fechar socket WhatsApp.',
+        error
+      );
+    } finally {
+      this.socket = null;
+      this.store = null;
+    }
+  }
+
+  resetConnectionState() {
+    this.isReady = false;
+    this.qrCode = null;
+    this.retryCount = 0;
+    this.lastReadTimestamps.clear();
+  }
+
+  clearAuthDirectory() {
+    try {
+      if (fs.existsSync(AUTH_DIR)) {
+        fs.rmSync(
+          AUTH_DIR,
+          {
+            recursive: true,
+            force: true,
+          }
+        );
+      }
+    } catch (error) {
+      this.logError(
+        'Erro ao limpar diretório de autenticação.',
+        error
+      );
     }
   }
 
@@ -331,55 +1093,34 @@ class WhatsAppService extends BaseService {
   // UTILITÁRIOS
   // ============================================================
 
-  isStartTrigger(text) {
-    if (!text) return false;
-    const cleanText = text.toLowerCase().trim();
-    const triggers = [
-      /^sim\b/i, /^oi\b/i, /^ol[aá]\b/i, /^iniciar\b/i, /^start\b/i,
-      /^menu\b/i, /^entrevista\b/i, /^bom dia\b/i, /^boa tarde\b/i,
-      /^boa noite\b/i, /^vaga\b/i, /^gostaria/i, /^quero/i,
-      /^pode começar/i, /^começar/i,
-    ];
-    return triggers.some(regex => regex.test(cleanText));
+  delay(ms) {
+    return new Promise(
+      (resolve) => setTimeout(resolve, ms)
+    );
   }
 
-  getStatus() {
-    return {
-      connected: this.isReady && this.socket?.user?.id,
-      qr_code: this.qrCode, // CORRIGIDO PARA snake_case
-      session: this.socket?.user?.id?.split(':')[0] || null,
-      message: this.isReady ? 'WhatsApp conectado e pronto' : this.qrCode ? 'Aguardando escaneamento do QR Code' : 'A iniciar sessão...'
-    };
+  getClient() {
+    return this.socket;
   }
 
-  async resetSession() {
-    try {
-      this.isConnecting = true;
-      if (this.socket) {
-        try { await this.socket.ws.close(); } catch (_) {}
-        this.socket = null;
-      }
-      this.isReady = false;
-      this.qrCode = null;
-      global.qrCode = null;
-      this.retryCount = 0;
-      if (fs.existsSync(AUTH_DIR)) {
-        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        fs.mkdirSync(AUTH_DIR, { recursive: true });
-      }
-      await this.delay(2000);
-      await this.initialize();
-      this.isConnecting = false;
-      return { success: true, message: 'Sessão reiniciada' };
-    } catch (error) {
-      console.error('[WHATSAPP] Erro ao reiniciar sessão:', error.message);
-      this.isConnecting = false;
-      return { success: false, message: error.message };
+  log(message) {
+    console.log(`[WHATSAPP] ${message}`);
+  }
+
+  logError(message, error = null) {
+    if (error) {
+      console.error(
+        `[WHATSAPP] ${message}`,
+        error?.stack || error?.message || error
+      );
+
+      return;
     }
-  }
 
-  delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-  getClient() { return this.socket; }
+    console.error(
+      `[WHATSAPP] ${message}`
+    );
+  }
 }
 
 module.exports = WhatsAppService;
