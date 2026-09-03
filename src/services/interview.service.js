@@ -15,37 +15,45 @@ const InterviewSession = require('../models/interview-session.model');
 const YaneIntegrationService = require('./yane-integration.service');
 
 // ============================================================
-// HELPERS
+// CONSTANTES
 // ============================================================
 
-const pick = (items = []) => {
-  if (!Array.isArray(items) || !items.length) return '';
-  return items[Math.floor(Math.random() * items.length)];
-};
+const DEFAULT_STAGE_ID = 'initial';
+const DEFAULT_HISTORY_LIMIT = 6;
+const DEFAULT_QUESTIONS_PER_STAGE = 3;
 
-const CLEAN = (value) =>
-  String(value || '')
-    .replace(/^["'`]+|["'`]+$/g, '')
-    .replace(/\s+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+const DEFAULT_TYPING_MS_PER_CHAR = 22;
+const DEFAULT_TYPING_MAX_MS = 2600;
 
-const SIMPLE_TONE = {
-  simple:
-    'Usa palavras simples, frases curtas e naturais. Evita jargão. Faz uma pergunta de cada vez.',
-  medium:
-    'Usa linguagem profissional, clara e acessível. Mantém a conversa natural e sem formalidade excessiva.',
-  advanced:
-    'Usa linguagem mais elaborada, mas continua natural, humana e fácil de acompanhar.',
-};
+const MAX_USED_OPENERS = 40;
+const MAX_RECENT_QUESTIONS = 8;
+const OVERUSED_WORD_THRESHOLD = 3;
 
-const VALIDATION_PHRASES = [
-  'Percebi.',
-  'Certo.',
-  'Faz sentido.',
-  'Já fiquei com uma ideia melhor.',
-  'Isso ajuda a perceber melhor.',
-  'Estou a acompanhar.',
+const FALLBACK_ACKNOWLEDGEMENTS = [
+  'Esse detalhe ajuda a perceber melhor a sua experiência.',
+  'Isso ajuda a colocar essa experiência em contexto.',
+  'Fica mais claro como lidou com essa situação.',
+  'Esse exemplo ajuda a perceber como trabalha na prática.',
+  'Esse contexto é útil para compreender melhor o seu percurso.',
+];
+
+const FALLBACK_SHORT_ANSWER_PROMPTS = [
+  'Pode dar-me um exemplo concreto disso?',
+  'Como foi essa situação na prática?',
+  'O que fez exactamente nessa situação?',
+  'Pode explicar um pouco melhor essa experiência?',
+];
+
+const FALLBACK_REPHRASES = [
+  'Deixe-me perguntar de outra forma:',
+  'Voltando ao que lhe perguntei:',
+  'Queria perceber melhor esta parte:',
+];
+
+const FALLBACK_RESUME_LINES = [
+  'Voltando ao que estávamos a falar:',
+  'Continuando a partir disso:',
+  'Pegando nesse ponto:',
 ];
 
 const BANNED_OPENERS = [
@@ -78,41 +86,89 @@ const BANNED_OPENERS = [
 const BANNED_RE = new RegExp(
   '^\\s*(' +
     BANNED_OPENERS
-      .map((word) =>
-        word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      )
+      .map(escapeRegex)
       .join('|') +
     ')\\b[\\s,.:;!—-]*',
   'i'
 );
-
-const ACK_FALLBACK = [
-  'Esse detalhe ajuda-me a perceber melhor a experiência que teve.',
-  'Fico com uma ideia mais clara de como lidou com essa situação.',
-  'Esse contexto é útil para perceber como trabalha na prática.',
-  'Consigo perceber melhor o tipo de situação que já enfrentou.',
-  'Isso ajuda a colocar a experiência em contexto.',
-];
 
 const STOPWORDS = new Set(
   (
     'a o as os um uma de do da dos das em no na nos nas e ou que se por para com sem sobre ' +
     'ao aos à às pelo pela isso isto esse essa este esta seu sua seus suas meu minha meus minhas ' +
     'muito mais já lhe me te nos vos ser estar tem ter é são foi era como quando onde qual quais ' +
-    'não sim para por uma uns umas dele dela'
-  ).split(' ')
+    'não sim dele dela'
+  ).split(/\s+/)
 );
 
-const words = (value) =>
-  String(value || '')
+// ============================================================
+// HELPERS PUROS
+// ============================================================
+
+function escapeRegex(value) {
+  return String(value).replace(
+    /[.*+?^${}()|[\]\\]/g,
+    '\\$&'
+  );
+}
+
+function pick(items = []) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return '';
+  }
+
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function clean(value) {
+  return String(value ?? '')
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function extractWords(value) {
+  return String(value ?? '')
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z\s]/g, ' ')
     .split(/\s+/)
     .filter(
-      (word) => word.length > 3 && !STOPWORDS.has(word)
+      (word) =>
+        word.length > 3 &&
+        !STOPWORDS.has(word)
     );
+}
+
+function clamp(value, min, max) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return min;
+  }
+
+  return Math.max(
+    min,
+    Math.min(max, number)
+  );
+}
+
+// ============================================================
+// TOM
+// ============================================================
+
+const SIMPLE_TONE = {
+  simple:
+    'Usa palavras simples, frases curtas e naturais. Evita jargão desnecessário. Uma pergunta de cada vez.',
+
+  medium:
+    'Usa linguagem profissional, clara e acessível. Mantém naturalidade e evita formalidade excessiva.',
+
+  advanced:
+    'Usa linguagem profissional mais elaborada, mas continua natural, humana e fácil de acompanhar.',
+};
 
 // ============================================================
 // SERVICE
@@ -123,6 +179,8 @@ class InterviewService extends BaseService {
     super();
 
     this.sessions = new Map();
+
+    // Mantidos para compatibilidade com o fluxo actual.
     this.questionCollector = new Map();
     this.collectorTimers = new Map();
 
@@ -130,14 +188,28 @@ class InterviewService extends BaseService {
     this.calendarService = new CalendarService();
     this.yaneIntegration = new YaneIntegrationService();
 
-    this.stages = STAGES;
+    this.stages = Array.isArray(STAGES)
+      ? STAGES
+      : [];
 
-    this.typingMsPerChar = 25;
-    this.typingMax = 3000;
+    this.typingMsPerChar =
+      Number(
+        INTERVIEW_CONFIG.typingMsPerChar
+      ) || DEFAULT_TYPING_MS_PER_CHAR;
+
+    this.typingMax =
+      Number(
+        INTERVIEW_CONFIG.typingMaxMs
+      ) || DEFAULT_TYPING_MAX_MS;
+
+    this.questionsPerStage =
+      Number(
+        INTERVIEW_CONFIG.questionsPerStage
+      ) || DEFAULT_QUESTIONS_PER_STAGE;
   }
 
   // ============================================================
-  // SESSÃO
+  // SESSÕES
   // ============================================================
 
   getSession(userId) {
@@ -145,12 +217,18 @@ class InterviewService extends BaseService {
   }
 
   endSession(userId) {
-    const session = this.sessions.get(userId);
+    const session =
+      this.sessions.get(userId);
 
     if (session) {
       try {
         session.cancelTimeout();
-      } catch (_) {}
+      } catch (error) {
+        console.warn(
+          '[INTERVIEW] Falha ao cancelar timeout:',
+          error.message
+        );
+      }
     }
 
     this.sessions.delete(userId);
@@ -158,84 +236,179 @@ class InterviewService extends BaseService {
   }
 
   resetInterviewState(session) {
-    const preservedHistory = Array.isArray(
-      session.conversationHistory
-    )
-      ? session.conversationHistory
-      : [];
+    if (!session) {
+      return;
+    }
 
+    const preserved = {
+      userId: session.userId,
+      candidateName: session.candidateName,
+      candidateEmail: session.candidateEmail,
+      jobTitle: session.jobTitle,
+      company: session.company,
+      jobVacancy: session.jobVacancy,
+      interviewId: session.interviewId,
+      holdTransactionId:
+        session.holdTransactionId,
+      recruiterId: session.recruiterId,
+      languageLevel:
+        session.languageLevel,
+    };
+
+    if (
+      typeof session.resetState ===
+      'function'
+    ) {
+      session.resetState();
+
+      session.userId =
+        preserved.userId;
+      session.candidateName =
+        preserved.candidateName;
+      session.candidateEmail =
+        preserved.candidateEmail;
+      session.jobTitle =
+        preserved.jobTitle;
+      session.company =
+        preserved.company;
+      session.jobVacancy =
+        preserved.jobVacancy;
+      session.interviewId =
+        preserved.interviewId;
+      session.holdTransactionId =
+        preserved.holdTransactionId;
+      session.recruiterId =
+        preserved.recruiterId;
+
+      session.languageLevel =
+        preserved.languageLevel || 'simple';
+
+      return;
+    }
+
+    // Compatibilidade com versões antigas
+    // do InterviewSession.
     session.stageIndex = 0;
-    session.conversationHistory = preservedHistory;
-    session.scores = [];
+    session.stage = DEFAULT_STAGE_ID;
+    session.currentQuestion = 0;
+    session.questionCounter = 0;
     session.lastQuestion = null;
 
-    session.inQASection = false;
-    session.questionCounter = 0;
-
     session.askedQuestions = new Set();
+    session.topicsCovered = [];
 
+    session.inQASection = false;
+    session.followUpPending = false;
     session.pendingCancel = false;
     session.offTopicAttempts = 0;
+    session.shortAnswerStreak = 0;
+    session.qaOffered = false;
 
-    session.topicsCovered = [];
-    session.turnCount = 0;
+    session.scores = [];
+    session.conversationHistory = [];
 
     session.usedOpeners = [];
     session.usedWords = {};
-
     session.ackStreak = 0;
-    session.qaOffered = false;
+    session.turnCount = 0;
 
-    session.shortAnswerStreak = 0;
+    session.languageLevel =
+      preserved.languageLevel || 'simple';
 
-    session.candidateEmail = session.candidateEmail || null;
-
-    session.languageLevel = 'simple';
+    session.candidateName =
+      preserved.candidateName;
+    session.candidateEmail =
+      preserved.candidateEmail;
+    session.jobTitle =
+      preserved.jobTitle;
+    session.company =
+      preserved.company;
+    session.jobVacancy =
+      preserved.jobVacancy;
+    session.interviewId =
+      preserved.interviewId;
+    session.holdTransactionId =
+      preserved.holdTransactionId;
+    session.recruiterId =
+      preserved.recruiterId;
+    session.userId =
+      preserved.userId;
   }
 
-  scheduleSessionTimeout(userId, session) {
+  scheduleSessionTimeout(
+    userId,
+    session
+  ) {
+    if (!session) {
+      return;
+    }
+
     try {
       session.cancelTimeout();
     } catch (_) {}
 
-    session.scheduleTimeout(async (expiredSession) => {
-      const currentSession = this.sessions.get(userId);
+    session.scheduleTimeout(
+      async (expiredSession) => {
+        const currentSession =
+          this.sessions.get(userId);
 
-      if (
-        !currentSession ||
-        currentSession !== expiredSession
-      ) {
-        return;
+        if (
+          !currentSession ||
+          currentSession !==
+            expiredSession
+        ) {
+          return;
+        }
+
+        if (
+          !this.isSessionExpired(
+            currentSession
+          )
+        ) {
+          return;
+        }
+
+        try {
+          await this.sendMessage(
+            userId,
+            this.generateTimeoutMessage(
+              currentSession
+            )
+          );
+        } finally {
+          this.endSession(userId);
+        }
+
+        console.log(
+          `[TIMEOUT] Sessão encerrada por inatividade: ${userId}`
+        );
       }
-
-      if (!this.isSessionExpired(currentSession)) {
-        return;
-      }
-
-      const message =
-        this.generateTimeoutMessage(currentSession);
-
-      await this.sendMessage(userId, message);
-
-      this.endSession(userId);
-
-      console.log(
-        `[TIMEOUT] Sessão encerrada por inatividade: ${userId}`
-      );
-    });
+    );
   }
 
   isSessionExpired(session) {
-    const timeoutMinutes = Number(
-      INTERVIEW_CONFIG.timeoutMinutes || 5
-    );
+    if (!session) {
+      return true;
+    }
 
-    const timeoutMs =
-      timeoutMinutes * 60 * 1000;
+    if (
+      typeof session.isExpired ===
+      'function'
+    ) {
+      return session.isExpired();
+    }
+
+    const timeoutMinutes =
+      Number(
+        INTERVIEW_CONFIG.timeoutMinutes
+      ) || 20;
 
     return (
-      Date.now() - Number(session.lastInteraction || 0) >
-      timeoutMs
+      Date.now() -
+        Number(
+          session.lastInteraction || 0
+        ) >
+      timeoutMinutes * 60 * 1000
     );
   }
 
@@ -250,20 +423,32 @@ class InterviewService extends BaseService {
     jobVacancy = null
   ) {
     try {
-      const session = new InterviewSession(userId);
+      const session =
+        new InterviewSession(userId);
 
       session.jobTitle =
-        jobTitle || JOB_VACANCY.title;
+        jobTitle ||
+        JOB_VACANCY.title ||
+        null;
 
       session.company =
-        company || COMPANY;
+        company ||
+        COMPANY ||
+        null;
 
       session.jobVacancy =
-        jobVacancy || JOB_VACANCY;
+        jobVacancy ||
+        JOB_VACANCY ||
+        null;
 
-      this.resetInterviewState(session);
+      this.resetInterviewState(
+        session
+      );
 
-      this.sessions.set(userId, session);
+      this.sessions.set(
+        userId,
+        session
+      );
 
       session.updateLastInteraction();
 
@@ -273,17 +458,19 @@ class InterviewService extends BaseService {
       );
 
       const welcomeMessage =
-        this.generateWelcomeMessage(session);
+        this.generateWelcomeMessage(
+          session
+        );
 
-      const whatsappService =
+      const whatsapp =
         global.whatsappService;
 
       if (
-        whatsappService &&
-        typeof whatsappService.sendInteractiveMessage ===
+        whatsapp &&
+        typeof whatsapp.sendInteractiveMessage ===
           'function'
       ) {
-        await whatsappService.sendInteractiveMessage(
+        await whatsapp.sendInteractiveMessage(
           userId,
           `Entrevista - ${session.getCompanyName()}`,
           welcomeMessage,
@@ -327,18 +514,17 @@ class InterviewService extends BaseService {
 
     const industry =
       session.company?.industry ||
-      COMPANY.industry ||
       '';
+
+    const roleText = industry
+      ? `Estamos a recrutar para a posição de ${jobTitle}, na área de ${industry}.`
+      : `Estamos a recrutar para a posição de ${jobTitle}.`;
 
     return [
       `Olá! Aqui é do processo de selecção da ${companyName}.`,
-      `Estamos a recrutar para a posição de ${jobTitle}${
-        industry
-          ? `, na área de ${industry}`
-          : ''
-      }.`,
+      roleText,
       '',
-      'A ideia é termos uma conversa tranquila sobre a sua experiência, a forma como trabalha e algumas situações reais que já enfrentou.',
+      'A ideia é termos uma conversa tranquila sobre o seu percurso, a sua experiência e algumas situações relacionadas com a função.',
       '',
       'Para começarmos, pode dizer-me o seu nome completo?',
     ].join('\n');
@@ -346,22 +532,24 @@ class InterviewService extends BaseService {
 
   generateTimeoutMessage(session) {
     const name =
-      this.firstName(session) ||
-      'candidato';
+      this.firstName(session);
 
     return [
-      `Olá, ${name}. Ficámos algum tempo sem receber resposta e a entrevista foi encerrada por inactividade.`,
+      `Olá, ${name}.`,
       '',
-      'Pode iniciar novamente quando estiver disponível.',
+      'Ficámos algum tempo sem receber resposta e a entrevista foi encerrada por inactividade.',
       '',
-      `Obrigado pelo seu interesse na ${session.getCompanyName()}.`,
+      `Pode iniciar novamente quando estiver disponível. Obrigado pelo seu interesse na ${session.getCompanyName()}.`,
     ].join('\n');
   }
 
-  async sendMessage(userId, text) {
+  async sendMessage(
+    userId,
+    text
+  ) {
     if (
-      !global.whatsappService ||
-      !text
+      !text ||
+      !global.whatsappService
     ) {
       return;
     }
@@ -380,7 +568,7 @@ class InterviewService extends BaseService {
   }
 
   // ============================================================
-  // MENSAGENS HUMANIZADAS
+  // ENVIO HUMANIZADO
   // ============================================================
 
   async sendHuman(
@@ -388,7 +576,9 @@ class InterviewService extends BaseService {
     text,
     client = global.whatsappService
   ) {
-    if (!text || !client) return;
+    if (!text || !client) {
+      return;
+    }
 
     const bubbles =
       this.splitBubbles(text);
@@ -404,14 +594,19 @@ class InterviewService extends BaseService {
             userId
           );
         }
-      } catch (_) {}
+      } catch (_) {
+        // Presença é apenas cosmética.
+      }
 
-      await this.delay(
+      const typingDelay =
         Math.min(
           bubble.length *
             this.typingMsPerChar,
           this.typingMax
-        )
+        );
+
+      await this.delay(
+        typingDelay
       );
 
       await client.sendMessage(
@@ -424,30 +619,26 @@ class InterviewService extends BaseService {
   }
 
   splitBubbles(text) {
-    const parts = String(text || '')
-      .split(/\n{2,}/)
-      .map((part) => part.trim())
-      .filter(Boolean);
+    const parts =
+      String(text || '')
+        .split(/\n{2,}/)
+        .map((part) =>
+          part.trim()
+        )
+        .filter(Boolean);
 
-    if (!parts.length) return [];
-
-    const merged = [];
-
-    for (const part of parts) {
-      const last =
-        merged[merged.length - 1];
-
-      if (
-        last &&
-        (last.length < 60 ||
-          part.length < 40)
-      ) {
-        merged[merged.length - 1] =
-          `${last}\n\n${part}`;
-      } else {
-        merged.push(part);
-      }
+    if (!parts.length) {
+      return [];
     }
+
+    if (parts.length <= 3) {
+      return this.mergeSmallBubbles(
+        parts
+      );
+    }
+
+    const merged =
+      this.mergeSmallBubbles(parts);
 
     if (merged.length <= 3) {
       return merged;
@@ -455,9 +646,35 @@ class InterviewService extends BaseService {
 
     return [
       merged[0],
-      merged.slice(1, -1).join('\n\n'),
+      merged
+        .slice(1, -1)
+        .join('\n\n'),
       merged[merged.length - 1],
     ];
+  }
+
+  mergeSmallBubbles(parts) {
+    const result = [];
+
+    for (const part of parts) {
+      const previous =
+        result[result.length - 1];
+
+      if (
+        previous &&
+        (
+          previous.length < 60 ||
+          part.length < 40
+        )
+      ) {
+        result[result.length - 1] =
+          `${previous}\n\n${part}`;
+      } else {
+        result.push(part);
+      }
+    }
+
+    return result;
   }
 
   delay(ms) {
@@ -467,10 +684,13 @@ class InterviewService extends BaseService {
   }
 
   // ============================================================
-  // PROCESSAMENTO PRINCIPAL
+  // FLUXO PRINCIPAL
   // ============================================================
 
-  async handleResponse(userId, message) {
+  async handleResponse(
+    userId,
+    message
+  ) {
     const session =
       this.getSession(userId);
 
@@ -478,32 +698,26 @@ class InterviewService extends BaseService {
       return null;
     }
 
-    const text = CLEAN(message);
+    const text = clean(message);
 
     if (!text) {
       return 'Pode enviar a sua resposta quando estiver pronto.';
     }
 
-    // ----------------------------------------------------------
-    // CANCELAMENTO
-    // ----------------------------------------------------------
-
-    const cancellationResponse =
+    const cancellation =
       await this.handleCancellationIntent(
         userId,
         session,
         text
       );
 
-    if (cancellationResponse !== null) {
-      return cancellationResponse;
+    if (cancellation !== null) {
+      return cancellation;
     }
 
-    // ----------------------------------------------------------
-    // TIMEOUT / INTERAÇÃO
-    // ----------------------------------------------------------
-
-    if (this.isSessionExpired(session)) {
+    if (
+      this.isSessionExpired(session)
+    ) {
       this.endSession(userId);
 
       return (
@@ -513,6 +727,7 @@ class InterviewService extends BaseService {
     }
 
     session.updateLastInteraction();
+
     session.turnCount =
       (session.turnCount || 0) + 1;
 
@@ -522,58 +737,64 @@ class InterviewService extends BaseService {
     );
 
     // ----------------------------------------------------------
-    // NOME
+    // IDENTIFICAÇÃO
     // ----------------------------------------------------------
 
     if (!session.candidateName) {
-      return await this.handleCandidateName(
+      return this.handleCandidateName(
         session,
         text
       );
     }
 
-    session.updateLanguageLevel(text);
+    session.updateLanguageLevel(
+      text
+    );
 
     // ----------------------------------------------------------
     // PERGUNTA DO CANDIDATO
     // ----------------------------------------------------------
 
-    if (this.isCandidateQuestion(text)) {
-      const reply =
+    if (
+      this.isCandidateQuestion(text)
+    ) {
+      const answer =
         await this.answerCandidate(
           session,
           text
         );
 
       return [
-        reply,
+        answer,
         '',
         this.resumeLine(session),
       ].join('\n');
     }
 
     // ----------------------------------------------------------
-    // RESPOSTAS CURTAS
+    // RESPOSTA MUITO CURTA
     // ----------------------------------------------------------
 
     if (this.isTooShort(text)) {
       session.shortAnswerStreak =
-        (session.shortAnswerStreak || 0) + 1;
+        (session.shortAnswerStreak || 0) +
+        1;
 
-      if (session.shortAnswerStreak < 2) {
-        return this.varied(session, [
-          `Conte-me um pouco mais sobre isso — um caso concreto ajuda-me a perceber melhor.`,
-          'Como foi essa situação na prática?',
-          'Lembra-se de uma situação real em que isso aconteceu?',
-          'E o que fez nessa situação?',
-        ]);
+      if (
+        session.shortAnswerStreak <=
+        (INTERVIEW_CONFIG.maxShortAnswerNudges || 1)
+      ) {
+        return this.varied(
+          session,
+          FALLBACK_SHORT_ANSWER_PROMPTS
+        );
       }
     } else {
       session.shortAnswerStreak = 0;
     }
 
     // ----------------------------------------------------------
-    // ANÁLISE PRINCIPAL
+    // ANÁLISE
     // ----------------------------------------------------------
 
     const turn =
@@ -588,24 +809,33 @@ class InterviewService extends BaseService {
 
     if (turn.off_topic) {
       session.offTopicAttempts =
-        (session.offTopicAttempts || 0) + 1;
+        (session.offTopicAttempts || 0) +
+        1;
+
+      const tolerance =
+        Number(
+          INTERVIEW_CONFIG.offTopicToleranceBeforeSkip
+        ) || 2;
 
       if (
-        session.offTopicAttempts >= 2
+        session.offTopicAttempts >=
+        tolerance
       ) {
-        return await this.advanceFocus(
+        return this.advanceFocus(
           session,
           turn.acknowledgement
         );
       }
 
-      return this.rephrase(session);
+      return this.rephrase(
+        session
+      );
     }
 
     session.offTopicAttempts = 0;
 
     // ----------------------------------------------------------
-    // REGISTAR TURNO
+    // REGISTO
     // ----------------------------------------------------------
 
     this.recordTurn(
@@ -615,29 +845,32 @@ class InterviewService extends BaseService {
     );
 
     // ----------------------------------------------------------
-    // FIM DA ENTREVISTA
+    // CONCLUSÃO
     // ----------------------------------------------------------
 
     if (turn.interview_complete) {
-      return await this.concludeInterview(
+      return this.concludeInterview(
         session
       );
     }
 
     session.questionCounter =
-      (session.questionCounter || 0) + 1;
+      (session.questionCounter || 0) +
+      1;
 
-    const questionsPerStage =
+    const stageQuestionLimit =
       Number(
-        INTERVIEW_CONFIG.questionsPerStage || 3
-      );
+        this.getCurrentStage()
+          ?.questionsPerStage
+      ) ||
+      this.questionsPerStage;
 
     if (
       turn.should_transition ||
       session.questionCounter >=
-        questionsPerStage
+        stageQuestionLimit
     ) {
-      return await this.advanceFocus(
+      return this.advanceFocus(
         session,
         turn.acknowledgement
       );
@@ -654,8 +887,12 @@ class InterviewService extends BaseService {
           turn.next_question
         );
 
-      session.lastQuestion = question;
-      session.askedQuestions.add(question);
+      session.lastQuestion =
+        question;
+
+      session.askedQuestions.add(
+        question
+      );
 
       return this.compose(
         session,
@@ -664,7 +901,7 @@ class InterviewService extends BaseService {
       );
     }
 
-    return await this.advanceFocus(
+    return this.advanceFocus(
       session,
       turn.acknowledgement
     );
@@ -736,34 +973,37 @@ class InterviewService extends BaseService {
       this.normalizeName(text);
 
     if (!name) {
-      return 'Não consegui perceber o nome. Pode escrever apenas o seu nome, por favor?';
+      return 'Não consegui perceber o nome. Pode escrever o seu nome, por favor?';
     }
 
-    session.candidateName = name;
+    session.candidateName =
+      name;
 
-    session.updateLanguageLevel(text);
+    session.updateLanguageLevel(
+      text
+    );
 
-    const firstQuestion =
+    const question =
       await this.askFirstQuestion(
         session
       );
 
     session.lastQuestion =
-      firstQuestion;
+      question;
 
     session.askedQuestions.add(
-      firstQuestion
+      question
     );
 
     return [
       `Muito prazer, ${this.firstName(session)}.`,
       '',
-      firstQuestion,
+      question,
     ].join('\n');
   }
 
   // ============================================================
-  // ANÁLISE DO TURNO
+  // ANÁLISE PRINCIPAL
   // ============================================================
 
   async analyzeTurn(
@@ -771,159 +1011,148 @@ class InterviewService extends BaseService {
     answer
   ) {
     const stage =
-      this.stages[session.stageIndex] ||
-      this.stages[this.stages.length - 1];
+      this.getCurrentStage();
 
     const agent =
-      AGENTS[stage.agent] ||
-      AGENTS.recruiter;
+      this.getStageAgent(stage);
 
-    const tone =
-      SIMPLE_TONE[
-        session.languageLevel
-      ] ||
-      SIMPLE_TONE.simple;
-
-    const historyText =
-      this.getRecentHistoryText(
-        session,
-        6
+    const context =
+      this.buildInterviewContext(
+        session
       );
 
-    const covered =
-      (session.topicsCovered || [])
-        .filter(Boolean)
-        .join('; ') ||
-      'nenhum ainda';
-
-    const asked =
-      Array.from(
-        session.askedQuestions || []
-      )
-        .slice(-5)
-        .join(' | ') ||
-      'nenhuma';
-
-    const overused =
-      this.getOverusedWords(
+    const tone =
+      this.getTone(
         session
       );
 
     const prompt = `
-És um recrutador experiente. Estás a conduzir uma entrevista profissional por WhatsApp.
+Analisa a última resposta do candidato durante uma entrevista profissional.
 
-A conversa deve parecer uma conversa real, não um questionário automático.
+Esta análise é INTERNA.
+Nunca reveles ao candidato os critérios, notas ou estrutura interna.
 
-OBJETIVO INTERNO DESTA PARTE:
-${stage.name} — ${stage.objective}
+CONTEXTO DA VAGA
+Título: ${context.jobTitle}
+Empresa: ${context.companyName}
 
-NÃO reveles este objetivo ao candidato.
+TEMA ACTUAL
+${stage?.name || 'Entrevista'}
+Objectivo:
+${stage?.objective || 'Recolher evidência relevante para a vaga.'}
 
-Candidato:
-${session.candidateName}
+ÁREAS DE FOCO
+${this.formatList(
+  stage?.focus
+)}
 
-Empresa:
-${session.getCompanyName()}
-
-Vaga:
-${session.getJobTitle()}
-
-Nível de linguagem:
-${session.languageLevel}
+CANDIDATO
+Nome: ${context.candidateName}
+Nível de linguagem: ${context.languageLevel}
 
 ${tone}
 
-TEMAS JÁ COBERTOS:
-${covered}
+TEMAS JÁ COBERTOS
+${context.coveredTopics}
 
-PERGUNTAS JÁ FEITAS:
-${asked}
+PERGUNTAS JÁ FEITAS
+${context.askedQuestions}
 
-HISTÓRICO RECENTE:
-${historyText || '(início da conversa)'}
+HISTÓRICO RECENTE
+${context.history || '(início da entrevista)'}
 
-ÚLTIMA PERGUNTA:
-${session.lastQuestion || '(nenhuma)'}
+ÚLTIMA PERGUNTA
+${context.lastQuestion || '(nenhuma)'}
 
-RESPOSTA DO CANDIDATO:
+RESPOSTA ACTUAL
 "${answer}"
 
-ANALISA A RESPOSTA E DEVOLVE APENAS JSON.
+AVALIAÇÃO INTERNA
 
 1. acknowledgement
-Uma reação humana curta, no máximo 15 palavras.
-Deve referir um detalhe concreto da resposta.
-Pode ser "" quando não existir nada relevante para comentar.
-
-Não comeces com:
-${BANNED_OPENERS.join(', ')}.
-
-Também evita estas palavras já usadas frequentemente:
-${overused || '(nenhuma)'}
+Uma reacção humana curta, no máximo 15 palavras.
+Quando possível, refere um detalhe concreto da resposta.
+Não elogies automaticamente.
+Pode ser "".
 
 2. score
-Nota geral de 0 a 10 para o conteúdo da resposta.
+Nota geral de 0 a 10 sobre a qualidade da evidência apresentada
+nesta resposta.
 
 3. clarity
-0 a 4.
+Nota de 0 a 4.
 
 4. relevance
-0 a 3.
+Nota de 0 a 3.
 
 5. depth
-0 a 3.
+Nota de 0 a 3.
 
-Avalia apenas o conteúdo da resposta, nunca ortografia, sotaque, género,
-idade, aparência, nacionalidade ou forma de escrever.
+Importante:
+Avalia conteúdo profissional.
+Não penalizes ortografia, sotaque, erros de escrita, mistura de idiomas,
+nível socioeconómico, idade, género, aparência ou estilo de comunicação.
 
 6. off_topic
-true somente quando a resposta estiver totalmente desconectada da pergunta.
+true apenas se a resposta estiver realmente desconectada da pergunta.
 
 7. generic
-true quando a resposta não apresentar substância suficiente ou parecer
-decorada, vaga ou sem exemplo concreto.
+true se a resposta for vaga, puramente declarativa ou sem evidência suficiente.
 
 8. emotion
-Uma palavra curta descrevendo o estado aparente na resposta.
+Estado aparente na resposta.
 Exemplos: confiante, neutro, inseguro, entusiasmado, frustrado.
 
 9. topic
-Duas a quatro palavras resumindo o assunto da resposta.
+Resume o principal assunto abordado em 2 a 4 palavras.
 
-10. next_question
-Uma única pergunta aberta que nasça naturalmente da resposta.
-Usa detalhes apresentados pelo candidato.
-Se a resposta for vaga, pede um exemplo concreto.
+10. evidence
+Descreve em poucas palavras o que a resposta efectivamente demonstrou.
+Não inventes competências.
+
+11. gap
+Indica a principal informação que ainda falta para avaliar esta parte da vaga.
+Pode ser "" quando não existir uma lacuna relevante.
+
+12. next_question
+Uma única pergunta natural.
+
+A próxima pergunta deve, por ordem de preferência:
+- aprofundar uma evidência concreta apresentada;
+- esclarecer uma lacuna relevante;
+- verificar uma competência da vaga ainda não suficientemente demonstrada;
+- explorar uma consequência ou resultado da experiência mencionada.
+
+Evita repetir perguntas já feitas.
+Não inventes experiências.
 Máximo de duas frases.
 
 Usa null quando for melhor mudar de foco.
 
-11. should_transition
-true quando já existir informação suficiente nesta etapa.
+13. should_transition
+true quando esta área já produziu evidência suficiente
+ou quando outra área da entrevista passou a ser mais importante.
 
-12. interview_complete
-true SOMENTE quando esta for realmente a última etapa
-e existir informação suficiente.
+14. interview_complete
+true SOMENTE quando todas as áreas essenciais da entrevista
+já tiverem sido suficientemente exploradas.
 
-13. feedback
-Nota interna curta, máximo 20 palavras.
-Não será mostrada ao candidato.
+15. feedback
+Nota interna curta, até 20 palavras.
 
-REGRAS DA CONVERSA:
+REGRAS:
 
-- uma pergunta de cada vez;
-- não repetir perguntas;
-- não elogiar automaticamente;
-- não usar emojis;
-- não dizer que o candidato está a ser avaliado;
-- não mencionar score;
-- não mencionar etapas ou fases;
-- não fazer comentários sobre a forma de escrever;
-- preferir perguntas que aprofundem algo que a pessoa acabou de dizer;
-- quando possível, pedir situações concretas;
-- não inventar informação.
+- Não transformes todas as respostas em elogios.
+- Não uses linguagem robótica.
+- Não trates o CV como prova definitiva.
+- Não assumes que uma competência existe só porque apareceu no CV.
+- Usa a vaga como referência do que realmente importa.
+- Procura comportamento e evidência observável.
+- Uma resposta curta não significa necessariamente uma resposta fraca.
+- Uma resposta longa não significa necessariamente uma resposta boa.
+- Não reveles notas ou critérios.
 
-JSON EXATO:
+JSON:
 
 {
   "acknowledgement": "",
@@ -935,6 +1164,8 @@ JSON EXATO:
   "generic": false,
   "emotion": "neutro",
   "topic": "",
+  "evidence": "",
+  "gap": "",
   "next_question": null,
   "should_transition": false,
   "interview_complete": false,
@@ -954,7 +1185,7 @@ JSON EXATO:
 
       if (!parsed) {
         throw new Error(
-          'Resposta da IA sem JSON válido'
+          'Resposta da IA sem JSON válido.'
         );
       }
 
@@ -974,94 +1205,116 @@ JSON EXATO:
   }
 
   normalizeTurn(turn = {}) {
-    const number = (
-      value,
-      max
-    ) => {
-      const parsed =
-        Number(value);
-
-      if (!Number.isFinite(parsed)) {
-        return 0;
-      }
-
-      return Math.max(
-        0,
-        Math.min(max, parsed)
-      );
-    };
-
     const acknowledgement =
-      CLEAN(
+      clean(
         turn.acknowledgement
       );
 
     const nextQuestion =
       turn.next_question
-        ? CLEAN(turn.next_question)
+        ? clean(
+            turn.next_question
+          )
         : null;
 
     return {
-      acknowledgement,
-      score: number(
+      acknowledgement:
+        this.cleanAcknowledgement(
+          acknowledgement
+        ),
+
+      score: clamp(
         turn.score,
+        0,
         10
       ),
-      clarity: number(
+
+      clarity: clamp(
         turn.clarity,
+        0,
         4
       ),
-      relevance: number(
+
+      relevance: clamp(
         turn.relevance,
+        0,
         3
       ),
-      depth: number(
+
+      depth: clamp(
         turn.depth,
+        0,
         3
       ),
+
       off_topic:
         turn.off_topic === true,
+
       generic:
         turn.generic === true,
+
       emotion:
-        CLEAN(turn.emotion).toLowerCase() ||
+        clean(turn.emotion).toLowerCase() ||
         'neutro',
-      topic: CLEAN(turn.topic),
+
+      topic:
+        clean(turn.topic),
+
+      evidence:
+        clean(turn.evidence),
+
+      gap:
+        clean(turn.gap),
+
       next_question:
         nextQuestion || null,
+
       should_transition:
         turn.should_transition === true,
+
       interview_complete:
         turn.interview_complete === true,
-      feedback: CLEAN(turn.feedback),
+
+      feedback:
+        clean(turn.feedback),
     };
   }
 
-  createTurnFallback(session) {
+  createTurnFallback(
+    session
+  ) {
     return {
       acknowledgement:
         this.varied(
           session,
-          ACK_FALLBACK
+          FALLBACK_ACKNOWLEDGEMENTS
         ),
+
       score: 5,
       clarity: 2,
       relevance: 2,
       depth: 1,
+
       off_topic: false,
       generic: false,
       emotion: 'neutro',
+
       topic: '',
+      evidence: '',
+      gap: '',
+
       next_question: null,
+
       should_transition: true,
       interview_complete: false,
+
       feedback:
         'Avaliação automática indisponível.',
     };
   }
 
   // ============================================================
-  // REGISTO DA CONVERSA
+  // REGISTO
   // ============================================================
 
   recordTurn(
@@ -1069,45 +1322,112 @@ JSON EXATO:
     answer,
     turn
   ) {
+    const score =
+      clamp(
+        turn.score,
+        0,
+        10
+      );
+
     const effectiveScore =
       turn.generic
         ? Math.max(
             0,
-            turn.score - 0.5
+            score - 0.5
           )
-        : turn.score;
+        : score;
 
-    session.scores.push({
-      score: effectiveScore,
-      clarity: turn.clarity,
-      relevance: turn.relevance,
-      depth: turn.depth,
-      feedback: turn.feedback,
-      question:
-        session.lastQuestion || '',
-      answer,
-      emotion: turn.emotion,
-      artificial: turn.generic,
-      topic: turn.topic || '',
-    });
+    if (
+      Array.isArray(session.scores)
+    ) {
+      session.scores.push({
+        score: effectiveScore,
+        clarity: clamp(
+          turn.clarity,
+          0,
+          4
+        ),
+        relevance: clamp(
+          turn.relevance,
+          0,
+          3
+        ),
+        depth: clamp(
+          turn.depth,
+          0,
+          3
+        ),
 
-    if (turn.topic) {
-      session.topicsCovered.push(
-        turn.topic
-      );
-    }
+        feedback:
+          turn.feedback || '',
 
-    if (session.lastQuestion) {
-      session.conversationHistory.push({
-        role: 'assistant',
-        content:
-          session.lastQuestion,
+        question:
+          session.lastQuestion || '',
+
+        answer,
+
+        emotion:
+          turn.emotion || 'neutro',
+
+        artificial:
+          turn.generic,
+
+        topic:
+          turn.topic || '',
+
+        evidence:
+          turn.evidence || '',
+
+        gap:
+          turn.gap || '',
       });
     }
 
+    if (turn.topic) {
+      session.topicsCovered =
+        session.topicsCovered || [];
+
+      if (
+        !session.topicsCovered.includes(
+          turn.topic
+        )
+      ) {
+        session.topicsCovered.push(
+          turn.topic
+        );
+      }
+    }
+
+    this.addConversationMessage(
+      session,
+      'assistant',
+      session.lastQuestion
+    );
+
+    this.addConversationMessage(
+      session,
+      'user',
+      answer
+    );
+  }
+
+  addConversationMessage(
+    session,
+    role,
+    content
+  ) {
+    if (
+      !content ||
+      !Array.isArray(
+        session.conversationHistory
+      )
+    ) {
+      return;
+    }
+
     session.conversationHistory.push({
-      role: 'user',
-      content: answer,
+      role,
+      content: String(content),
     });
   }
 
@@ -1115,44 +1435,57 @@ JSON EXATO:
   // PRIMEIRA PERGUNTA
   // ============================================================
 
-  async askFirstQuestion(session) {
+  async askFirstQuestion(
+    session
+  ) {
     const stage =
-      this.stages[session.stageIndex] ||
-      this.stages[0];
+      this.getCurrentStage();
 
     const agent =
-      AGENTS[stage.agent] ||
-      AGENTS.recruiter;
+      this.getStageAgent(stage);
 
     const tone =
-      SIMPLE_TONE[
-        session.languageLevel
-      ] ||
-      SIMPLE_TONE.simple;
+      this.getTone(
+        session
+      );
+
+    const jobContext =
+      this.getJobContext(
+        session
+      );
 
     const prompt = `
-Vais iniciar uma entrevista por WhatsApp com ${session.candidateName},
-candidato à vaga de ${session.getJobTitle()}.
+Vais iniciar uma entrevista profissional por WhatsApp.
 
-Objetivo interno:
-${stage.objective}
+CANDIDATO
+Nome: ${session.candidateName}
 
-Não reveles esse objetivo.
+VAGA
+Título: ${jobContext.jobTitle}
+Empresa: ${jobContext.companyName}
+
+TEMA INICIAL
+${stage?.objective || ''}
 
 ${tone}
 
-Escreve UMA pergunta de abertura natural.
-A pessoa deve conseguir contar uma experiência ou situação concreta.
+Cria a primeira pergunta da entrevista.
 
-Não uses:
-- "fale-me um pouco sobre si";
-- linguagem de questionário;
-- "etapa";
-- "fase";
-- "avaliação";
-- frases muito formais.
+A pergunta deve:
+- ser natural;
+- criar espaço para o candidato apresentar o seu percurso;
+- ser relevante para a vaga;
+- permitir encontrar uma experiência que possa ser aprofundada;
+- não presumir experiência formal;
+- não repetir informação já disponível no contexto.
+
+Uma abertura equivalente a "fala-me um pouco sobre o teu percurso"
+é aceitável quando realmente ainda falta contexto.
+
+Evita perguntas vazias ou excessivamente genéricas.
 
 Máximo de duas frases.
+Uma pergunta principal.
 Sem emojis.
 
 Responde apenas com a pergunta.
@@ -1160,75 +1493,90 @@ Responde apenas com a pergunta.
 
     try {
       const question =
-        await this.generateAI(
-          prompt,
-          agent.systemPrompt
+        clean(
+          await this.generateAI(
+            prompt,
+            agent.systemPrompt
+          )
         );
 
-      return (
-        CLEAN(question) ||
-        this.fallbackQuestion(stage)
-      );
+      if (question) {
+        return this.dedupeQuestion(
+          session,
+          question
+        );
+      }
     } catch (error) {
       console.error(
         '[INTERVIEW] Falha na primeira pergunta:',
         error.message
       );
-
-      return this.fallbackQuestion(
-        stage
-      );
     }
+
+    return this.fallbackQuestion(
+      stage
+    );
   }
 
   fallbackQuestion(stage) {
-    const objective =
-      String(
-        stage?.objective ||
-          'o seu percurso profissional'
-      ).toLowerCase();
+    const hint =
+      stage?.openingHint ||
+      'Conte-me um pouco sobre o seu percurso profissional e a experiência mais relevante para esta vaga.';
 
-    return `Conte-me uma situação recente do seu trabalho que tenha relação com ${objective}.`;
+    return clean(hint);
   }
 
   // ============================================================
-  // TRANSIÇÃO ENTRE TEMAS
+  // TRANSIÇÃO
   // ============================================================
 
   async advanceFocus(
     session,
     acknowledgement = ''
   ) {
+    const currentIndex =
+      Number(
+        session.stageIndex || 0
+      );
+
     if (
-      session.stageIndex >=
+      currentIndex >=
       this.stages.length - 1
     ) {
-      return await this.concludeInterview(
+      return this.concludeInterview(
         session
       );
     }
 
     const previousStage =
-      this.stages[session.stageIndex];
+      this.stages[currentIndex];
 
-    session.stageIndex += 1;
+    session.stageIndex =
+      currentIndex + 1;
+
+    session.stage =
+      this.stages[
+        session.stageIndex
+      ]?.id ||
+      DEFAULT_STAGE_ID;
+
     session.questionCounter = 0;
     session.offTopicAttempts = 0;
 
     const nextStage =
-      this.stages[session.stageIndex];
+      this.getCurrentStage();
 
     const agent =
-      AGENTS[nextStage.agent] ||
-      AGENTS.recruiter;
+      this.getStageAgent(
+        nextStage
+      );
 
-    const tone =
-      SIMPLE_TONE[
-        session.languageLevel
-      ] ||
-      SIMPLE_TONE.simple;
+    const context =
+      this.buildInterviewContext(
+        session
+      );
 
-    const recentAnswers =
+    const previousAnswers =
       session.conversationHistory
         .filter(
           (message) =>
@@ -1241,44 +1589,43 @@ Responde apenas com a pergunta.
         )
         .join(' ');
 
-    const overused =
-      this.getOverusedWords(
-        session
-      );
-
     const prompt = `
-Estás a conduzir uma entrevista profissional por WhatsApp.
+Continua uma entrevista profissional por WhatsApp.
 
-Candidato:
-${session.candidateName}
+CANDIDATO
+${context.candidateName}
 
-Vaga:
-${session.getJobTitle()}
+VAGA
+${context.jobTitle}
 
-A pessoa acabou de dizer:
-"${recentAnswers}"
+ÚLTIMA PARTE DA CONVERSA
+${previousAnswers || '(sem resposta disponível)'}
 
-Tema anterior:
-${previousStage.objective}
+TEMA ANTERIOR
+${previousStage?.objective || ''}
 
-Novo tema interno:
-${nextStage.objective}
+NOVO TEMA
+${nextStage?.objective || ''}
 
-Cria UMA pergunta natural que faça uma ponte entre os dois assuntos.
+ÁREAS DE FOCO
+${this.formatList(
+  nextStage?.focus
+)}
+
+Cria UMA pergunta natural que faça a transição sem parecer que começou
+um novo questionário.
+
+Sempre que possível, usa algo que o candidato acabou de mencionar como ponte.
 
 Não digas:
 - "agora vamos falar de";
 - "mudando de assunto";
 - "passando para";
 - "na próxima etapa";
-- "vamos avaliar".
+- "vamos avaliar";
+- "agora vou avaliar".
 
-Parte de algo que a pessoa acabou de dizer sempre que possível.
-
-Evita estas palavras muito utilizadas:
-${overused || '(nenhuma)'}
-
-${tone}
+Evita repetir perguntas já feitas.
 
 Máximo de duas frases.
 Sem emojis.
@@ -1288,7 +1635,7 @@ Responde apenas com a pergunta.
     let question = '';
 
     try {
-      question = CLEAN(
+      question = clean(
         await this.generateAI(
           prompt,
           agent.systemPrompt
@@ -1307,6 +1654,12 @@ Responde apenas com a pergunta.
           nextStage
         );
     }
+
+    question =
+      this.dedupeQuestion(
+        session,
+        question
+      );
 
     session.lastQuestion =
       question;
@@ -1333,27 +1686,30 @@ Responde apenas com a pergunta.
   }
 
   // ============================================================
-  // Q&A DO CANDIDATO
+  // Q&A
   // ============================================================
 
   isCandidateQuestion(text) {
     const value =
-      String(text || '')
-        .trim()
-        .toLowerCase();
+      clean(text).toLowerCase();
 
-    if (!value) return false;
+    if (!value) {
+      return false;
+    }
 
-    const hasQuestionMark =
-      /[?؟]$/.test(value);
+    const directQuestionPattern =
+      /(qual [ée] o sal[áa]rio|como funciona|onde fica|quais [sãa]o os benef[íi]cios|qual [ée] o hor[áa]rio|qual [ée] o regime|voc[êe]s pagam|quanto [ée] o sal[áa]rio|quando come[çc]a)/i;
 
-    const candidateQuestionTerms =
-      /(voc[êe]s|empresa|vaga|sal[áa]rio|hor[áa]rio|equipa|contrato|remunera|benef[íi]cio|processo|quando|onde fica|como funciona|quanto|regime|local de trabalho|entrada)/i;
+    const interrogativePattern =
+      /^(como|quanto|qual|quais|onde|quando|o que|porque|por que|posso|gostaria de saber|voc[êe]s|tem)\b/i;
 
     return (
-      hasQuestionMark ||
-      candidateQuestionTerms.test(
+      directQuestionPattern.test(
         value
+      ) ||
+      (
+        /[?؟]$/.test(value) &&
+        interrogativePattern.test(value)
       )
     );
   }
@@ -1362,7 +1718,7 @@ Responde apenas com a pergunta.
     session,
     question
   ) {
-    return await this.generateBatchAnswers(
+    return this.generateBatchAnswers(
       [question],
       session
     );
@@ -1372,57 +1728,66 @@ Responde apenas com a pergunta.
     questions,
     session
   ) {
-    try {
-      const questionsText =
-        questions
-          .map(
-            (question, index) =>
-              `${index + 1}. ${question}`
-          )
-          .join('\n');
+    const validQuestions =
+      Array.isArray(questions)
+        ? questions.filter(Boolean)
+        : [];
 
-      const tone =
-        SIMPLE_TONE[
-          session.languageLevel
-        ] ||
-        SIMPLE_TONE.simple;
+    if (!validQuestions.length) {
+      return 'Essa informação preciso de confirmar com a equipa antes de lhe responder com segurança.';
+    }
 
-      const company =
-        session.company ||
-        COMPANY;
+    const questionsText =
+      validQuestions
+        .map(
+          (question, index) =>
+            `${index + 1}. ${question}`
+        )
+        .join('\n');
 
-      const jobVacancy =
-        session.jobVacancy ||
-        JOB_VACANCY;
+    const tone =
+      this.getTone(
+        session
+      );
 
-      const prompt = `
-Responde às perguntas de um candidato durante uma entrevista profissional em português de Moçambique.
+    const company =
+      session.company ||
+      COMPANY;
 
-PERGUNTAS:
+    const jobVacancy =
+      session.jobVacancy ||
+      JOB_VACANCY;
+
+    const prompt = `
+Responde às perguntas de um candidato durante uma entrevista profissional.
+
+PERGUNTAS
 ${questionsText}
 
-EMPRESA:
+EMPRESA
 ${JSON.stringify(company)}
 
-VAGA:
+VAGA
 ${JSON.stringify(jobVacancy)}
 
 ${tone}
 
 REGRAS:
-
 - responde directamente;
-- não uses uma introdução longa;
-- responde cada pergunta separadamente quando houver mais de uma;
-- usa apenas informação fornecida sobre a empresa e vaga;
-- não inventes salário, benefícios, horários ou políticas;
-- se não existir informação suficiente, diz que será necessário confirmar com a equipa;
-- assuntos de remuneração pessoal devem ser encaminhados para o RH;
+- sê breve;
+- não inventes informação;
+- usa apenas os dados fornecidos;
+- não inventes salário, benefícios, horários, políticas ou condições;
+- quando faltar informação, diz claramente que precisa de confirmação;
+- questões de remuneração pessoal devem ser encaminhadas para o RH;
+- não reveles critérios internos da entrevista;
 - sem emojis;
 - mantém tom humano.
 
+Responde apenas ao que foi perguntado.
 `;
 
+    try {
       const response =
         await this.generateAI(
           prompt,
@@ -1430,7 +1795,7 @@ REGRAS:
         );
 
       return (
-        CLEAN(response) ||
+        clean(response) ||
         'Essa informação preciso de confirmar com a equipa antes de lhe responder com segurança.'
       );
     } catch (error) {
@@ -1439,9 +1804,7 @@ REGRAS:
         error.message
       );
 
-      return (
-        'Essa informação preciso de confirmar com a equipa antes de lhe responder com segurança.'
-      );
+      return 'Essa informação preciso de confirmar com a equipa antes de lhe responder com segurança.';
     }
   }
 
@@ -1456,14 +1819,18 @@ REGRAS:
     const lastQuestion =
       session.lastQuestion || '';
 
+    if (!lastQuestion) {
+      return false;
+    }
+
     const prompt = `
-Pergunta feita:
+PERGUNTA
 "${lastQuestion}"
 
-Resposta:
+RESPOSTA
 "${message}"
 
-A resposta está totalmente fora do assunto da pergunta?
+A resposta está TOTALMENTE fora do assunto da pergunta?
 
 Responde apenas:
 SIM
@@ -1479,35 +1846,33 @@ NÃO
         );
 
       return /^sim\b/i.test(
-        CLEAN(answer)
+        clean(answer)
       );
     } catch (error) {
       return false;
     }
   }
 
-  handleOffTopic(session) {
+  handleOffTopic(
+    session
+  ) {
     const question =
       session.lastQuestion ||
       'Conte-me um pouco mais sobre a sua experiência.';
 
-    const lead =
-      this.varied(session, [
-        'Deixe-me perguntar de outra forma:',
-        'Voltando ao que lhe perguntei:',
-        'O que queria perceber era isto:',
-      ]);
-
-    return `${lead} ${question}`;
+    return `${this.varied(
+      session,
+      FALLBACK_REPHRASES
+    )} ${question}`;
   }
 
   // ============================================================
-  // CONTROLO DE REPETIÇÃO
+  // REPETIÇÃO / LINGUAGEM
   // ============================================================
 
   openerKey(text) {
-    return words(text)
-      .slice(0, 2)
+    return extractWords(text)
+      .slice(0, 3)
       .join(' ');
   }
 
@@ -1515,10 +1880,16 @@ NÃO
     session,
     text
   ) {
+    if (!session || !text) {
+      return;
+    }
+
     session.usedWords =
       session.usedWords || {};
 
-    for (const word of words(text)) {
+    for (const word of extractWords(
+      text
+    )) {
       session.usedWords[word] =
         (session.usedWords[word] || 0) +
         1;
@@ -1527,134 +1898,153 @@ NÃO
     const key =
       this.openerKey(text);
 
-    if (key) {
+    if (!key) {
+      return;
+    }
+
+    session.usedOpeners =
+      session.usedOpeners || [];
+
+    if (
+      !session.usedOpeners.includes(
+        key
+      )
+    ) {
+      session.usedOpeners.push(key);
+    }
+
+    if (
+      session.usedOpeners.length >
+      MAX_USED_OPENERS
+    ) {
       session.usedOpeners =
-        session.usedOpeners || [];
-
-      if (
-        !session.usedOpeners.includes(
-          key
-        )
-      ) {
-        session.usedOpeners.push(
-          key
+        session.usedOpeners.slice(
+          -MAX_USED_OPENERS
         );
-      }
-
-      // Mantém apenas histórico recente.
-      if (
-        session.usedOpeners.length > 40
-      ) {
-        session.usedOpeners =
-          session.usedOpeners.slice(-40);
-      }
     }
   }
 
-  getOverusedWords(session) {
+  getOverusedWords(
+    session
+  ) {
     return Object.entries(
       session.usedWords || {}
     )
       .filter(
-        ([, count]) => count >= 2
+        ([, count]) =>
+          count >= 2
       )
       .sort(
         (a, b) => b[1] - a[1]
       )
       .slice(0, 15)
-      .map(([word]) => word)
+      .map(
+        ([word]) => word
+      )
       .join(', ');
   }
 
-  cleanAck(
-    session,
+  cleanAcknowledgement(
     acknowledgement
   ) {
     let value =
-      CLEAN(acknowledgement);
+      clean(acknowledgement);
 
-    if (!value) return '';
+    if (!value) {
+      return '';
+    }
 
-    let attempts = 0;
-    let trimmed = false;
+    let iterations = 0;
 
     while (
       BANNED_RE.test(value) &&
-      attempts < 3
+      iterations < 3
     ) {
-      value = CLEAN(
+      value = clean(
         value.replace(
           BANNED_RE,
           ''
         )
       );
 
-      trimmed = true;
-      attempts += 1;
+      iterations++;
     }
+
+    return value;
+  }
+
+  cleanAck(
+    session,
+    acknowledgement
+  ) {
+    const value =
+      this.cleanAcknowledgement(
+        acknowledgement
+      );
 
     if (!value) {
       return '';
     }
-
-    if (
-      trimmed &&
-      (value.length < 30 ||
-        /^(que|o que|isso|isto|e |mas |faz|para mim)\b/i.test(
-          value
-        ))
-    ) {
-      return '';
-    }
-
-    value =
-      value.charAt(0).toUpperCase() +
-      value.slice(1);
 
     const key =
       this.openerKey(value);
 
     if (
       key &&
-      (session.usedOpeners || [])
-        .includes(key)
+      (
+        session.usedOpeners || []
+      ).includes(key)
     ) {
       return '';
     }
 
-    const overused =
-      words(value).some(
+    const repeatedWord =
+      extractWords(value).some(
         (word) =>
-          (session.usedWords || {})[
-            word
-          ] >= 3
+          (
+            session.usedWords || {}
+          )[word] >=
+          OVERUSED_WORD_THRESHOLD
       );
 
-    if (overused) {
+    if (repeatedWord) {
       return '';
     }
 
-    return value;
+    return value.charAt(0).toUpperCase() +
+      value.slice(1);
   }
 
   varied(
     session,
     options
   ) {
+    const validOptions =
+      Array.isArray(options)
+        ? options.filter(Boolean)
+        : [];
+
+    if (!validOptions.length) {
+      return '';
+    }
+
     const fresh =
-      options.filter(
+      validOptions.filter(
         (option) =>
-          !(session.usedOpeners || [])
-            .includes(
-              this.openerKey(option)
+          !(
+            session.usedOpeners || []
+          ).includes(
+            this.openerKey(
+              option
             )
+          )
       );
 
     const selected =
       pick(
         fresh.length
           ? fresh
-          : options
+          : validOptions
       );
 
     this.registerLanguage(
@@ -1671,7 +2061,7 @@ NÃO
     question
   ) {
     const cleanQuestion =
-      CLEAN(question);
+      clean(question);
 
     if (!cleanQuestion) {
       return '';
@@ -1683,7 +2073,8 @@ NÃO
         acknowledgement
       );
 
-    // Evita cadeias de validações automáticas.
+    // Evita várias validações seguidas,
+    // porque começam a parecer uma fórmula.
     if (
       reaction &&
       (session.ackStreak || 0) >= 1
@@ -1691,13 +2082,13 @@ NÃO
       reaction = '';
     }
 
+    this.registerLanguage(
+      session,
+      cleanQuestion
+    );
+
     if (!reaction) {
       session.ackStreak = 0;
-
-      this.registerLanguage(
-        session,
-        cleanQuestion
-      );
 
       return cleanQuestion;
     }
@@ -1710,57 +2101,79 @@ NÃO
       reaction
     );
 
-    this.registerLanguage(
-      session,
-      cleanQuestion
-    );
-
-    const validation =
-      pick(
-        VALIDATION_PHRASES
-      );
-
-    return `${validation} ${reaction}\n\n${cleanQuestion}`;
+    return `${reaction}\n\n${cleanQuestion}`;
   }
 
   // ============================================================
-  // PERGUNTAS DUPLICADAS
+  // DEDUPLICAÇÃO
   // ============================================================
 
   dedupeQuestion(
     session,
     question
   ) {
-    const cleanQuestion =
-      CLEAN(question);
+    const candidate =
+      clean(question);
 
-    if (!cleanQuestion) {
+    if (!candidate) {
       return this.fallbackQuestion(
-        this.stages[
-          session.stageIndex
-        ]
+        this.getCurrentStage()
       );
     }
 
     const asked =
       Array.from(
         session.askedQuestions || []
+      ).slice(
+        -MAX_RECENT_QUESTIONS
       );
 
     if (
       !this.isQuestionTooSimilar(
-        cleanQuestion,
+        candidate,
         asked
       )
     ) {
-      return cleanQuestion;
+      return candidate;
     }
 
-    // Em vez de apenas colocar:
-    // "Deixe-me perguntar de outra forma..."
-    //
-    // tentamos uma variação curta.
-    return `Pode dar-me um exemplo concreto disso?`;
+    return this.getAlternativeQuestion(
+      session
+    );
+  }
+
+  getAlternativeQuestion(
+    session
+  ) {
+    const alternatives = [
+      'Pode dar-me um exemplo concreto disso?',
+      'E qual foi exactamente o seu papel nessa situação?',
+      'O que fez a seguir?',
+      'Qual foi o resultado dessa experiência?',
+    ];
+
+    const asked =
+      Array.from(
+        session.askedQuestions || []
+      );
+
+    const fresh =
+      alternatives.filter(
+        (question) =>
+          !asked.some(
+            (old) =>
+              this.isQuestionTooSimilar(
+                question,
+                [old]
+              )
+          )
+      );
+
+    return pick(
+      fresh.length
+        ? fresh
+        : alternatives
+    );
   }
 
   isQuestionTooSimilar(
@@ -1768,7 +2181,9 @@ NÃO
     askedQuestions
   ) {
     const currentWords =
-      new Set(words(question));
+      new Set(
+        extractWords(question)
+      );
 
     if (!currentWords.size) {
       return false;
@@ -1777,7 +2192,11 @@ NÃO
     return askedQuestions.some(
       (oldQuestion) => {
         const oldWords =
-          new Set(words(oldQuestion));
+          new Set(
+            extractWords(
+              oldQuestion
+            )
+          );
 
         if (!oldWords.size) {
           return false;
@@ -1785,8 +2204,12 @@ NÃO
 
         let intersection = 0;
 
-        for (const word of currentWords) {
-          if (oldWords.has(word)) {
+        for (
+          const word of currentWords
+        ) {
+          if (
+            oldWords.has(word)
+          ) {
             intersection++;
           }
         }
@@ -1808,14 +2231,10 @@ NÃO
       session.lastQuestion ||
       'Conte-me um pouco mais sobre a sua experiência.';
 
-    const lead =
-      this.varied(session, [
-        'Deixe-me perguntar de outra forma:',
-        'Voltando ao que lhe perguntei:',
-        'O que queria perceber era isto:',
-      ]);
-
-    return `${lead} ${question}`;
+    return `${this.varied(
+      session,
+      FALLBACK_REPHRASES
+    )} ${question}`;
   }
 
   resumeLine(session) {
@@ -1823,21 +2242,19 @@ NÃO
       session.lastQuestion ||
       'Conte-me um pouco mais sobre o seu percurso.';
 
-    const lead =
-      this.varied(session, [
-        'Voltando ao que estávamos a falar:',
-        'Continuando de onde ficámos:',
-        'E pegando nisso:',
-      ]);
-
-    return `${lead} ${question}`;
+    return `${this.varied(
+      session,
+      FALLBACK_RESUME_LINES
+    )} ${question}`;
   }
 
   // ============================================================
   // CONCLUSÃO
   // ============================================================
 
-  async concludeInterview(session) {
+  async concludeInterview(
+    session
+  ) {
     const averageScore =
       this.calculateFinalScore(
         session
@@ -1861,13 +2278,14 @@ NÃO
 
     const genericCount =
       session.scores.filter(
-        (score) => score.artificial
+        (score) =>
+          score.artificial
       ).length;
 
     if (genericCount >= 2) {
       lines.push(
         '',
-        'Nas próximas conversas, exemplos concretos do que já fez podem ajudar a mostrar melhor a sua experiência.'
+        'Exemplos concretos das experiências que já teve ajudam a mostrar melhor o seu percurso.'
       );
     }
 
@@ -1888,7 +2306,8 @@ NÃO
           Number(
             averageScore.toFixed(1)
           ),
-        classificacao: result,
+        classificacao:
+          result,
         respostas:
           session.scores.length,
         languageLevel:
@@ -1909,12 +2328,14 @@ NÃO
     result,
     lines
   ) {
+    const passingScore =
+      Number(
+        INTERVIEW_CONFIG.minScoreToPass
+      ) || 6;
+
     const passed =
       averageScore >=
-      Number(
-        INTERVIEW_CONFIG.minScoreToPass ||
-          6
-      );
+      passingScore;
 
     await this.sendInterviewResult(
       session,
@@ -1944,11 +2365,18 @@ NÃO
               session.candidateName
             );
 
-          lines.push(
-            '',
-            `Os detalhes foram enviados para ${email}.`,
-            `Link da reunião: ${meetingLink}`
-          );
+          if (meetingLink) {
+            lines.push(
+              '',
+              `Os detalhes foram enviados para ${email}.`,
+              `Link da reunião: ${meetingLink}`
+            );
+          } else {
+            lines.push(
+              '',
+              `Os detalhes foram enviados para ${email}.`
+            );
+          }
         } else {
           lines.push(
             '',
@@ -1998,19 +2426,22 @@ NÃO
             null,
           jobTitle:
             session.getJobTitle(),
-          score: Number(
-            averageScore.toFixed(2)
-          ),
+          score:
+            Number(
+              averageScore.toFixed(2)
+            ),
           feedback: result,
-          recommendation: passed
-            ? 'approve'
-            : 'hold',
+          recommendation:
+            passed
+              ? 'approve'
+              : 'hold',
           transcript:
             session.conversationHistory,
           scoresBreakdown:
             session.scores,
           interviewId:
-            session.interviewId || null,
+            session.interviewId ||
+            null,
           holdTransactionId:
             session.holdTransactionId ||
             null,
@@ -2031,7 +2462,15 @@ NÃO
       session.scores
         .map(
           (score) =>
-            `Pergunta: ${score.question}\nResposta: ${score.answer}`
+            [
+              `Pergunta: ${score.question}`,
+              `Resposta: ${score.answer}`,
+              score.evidence
+                ? `Evidência: ${score.evidence}`
+                : '',
+            ]
+              .filter(Boolean)
+              .join('\n')
         )
         .join('\n\n');
 
@@ -2040,23 +2479,31 @@ NÃO
     }
 
     const prompt = `
-Com base nesta entrevista, escreve um resumo curto para o candidato.
+Escreve um resumo curto da entrevista para o candidato.
 
 O texto deve ter 2 ou 3 frases.
 
-Destaca pontos fortes CONCRETOS que a pessoa realmente demonstrou.
+BASEIA-TE APENAS NO QUE FOI REALMENTE DEMONSTRADO
+NAS RESPOSTAS.
+
+Destaca:
+- experiências concretas;
+- competências demonstradas;
+- formas de trabalhar observáveis.
+
 Não inventes características.
-Não atribuas competências que não aparecem nas respostas.
+Não confundas aquilo que o candidato afirmou saber com aquilo que demonstrou.
 
 Não uses:
-- emojis;
 - notas;
 - pontuações;
+- critérios;
+- emojis;
 - clichés;
-- "foi uma excelente entrevista";
-- elogios genéricos.
+- elogios genéricos;
+- "foi uma excelente entrevista".
 
-Entrevista:
+ENTREVISTA
 
 ${history}
 `;
@@ -2069,7 +2516,7 @@ ${history}
         );
 
       return (
-        CLEAN(summary) ||
+        clean(summary) ||
         'Obrigado por partilhar a sua experiência e o seu percurso connosco.'
       );
     } catch (error) {
@@ -2083,32 +2530,14 @@ ${history}
   }
 
   // ============================================================
-  // AI WRAPPER
+  // AI
   // ============================================================
 
   async generateAI(
     prompt,
     systemPrompt
   ) {
-    const messages = [
-      {
-        role: 'system',
-        content:
-          systemPrompt ||
-          AGENTS.recruiter.systemPrompt,
-      },
-      {
-        role: 'user',
-        content: prompt,
-      },
-    ];
-
-    // Mantém a compatibilidade com o AIService atual.
-    //
-    // O serviço atual expõe generateResponse().
-    // Centralizar aqui permite trocar o provider futuramente
-    // sem alterar toda a entrevista.
-    return await this.aiService.generateResponse(
+    return this.aiService.generateResponse(
       prompt,
       systemPrompt
     );
@@ -2118,51 +2547,64 @@ ${history}
   // JSON
   // ============================================================
 
-  parseJsonObject(response) {
+  parseJsonObject(
+    response
+  ) {
     const text =
-      CLEAN(response);
+      clean(response);
 
     if (!text) {
       return null;
     }
 
-    // Primeiro tenta resposta JSON pura.
+    // JSON directo.
     try {
-      const direct =
+      const parsed =
         JSON.parse(text);
 
       if (
-        direct &&
-        typeof direct === 'object'
+        parsed &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed)
       ) {
-        return direct;
+        return parsed;
       }
     } catch (_) {}
 
-    // Remove possíveis fences.
-    const clean =
+    // Markdown fence.
+    const fenced =
       text
-        .replace(/^```json\s*/i, '')
-        .replace(/^```\s*/i, '')
-        .replace(/\s*```$/i, '')
+        .replace(
+          /^```json\s*/i,
+          ''
+        )
+        .replace(
+          /^```\s*/i,
+          ''
+        )
+        .replace(
+          /\s*```$/i,
+          ''
+        )
         .trim();
 
     try {
-      const direct =
-        JSON.parse(clean);
+      const parsed =
+        JSON.parse(fenced);
 
       if (
-        direct &&
-        typeof direct === 'object'
+        parsed &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed)
       ) {
-        return direct;
+        return parsed;
       }
     } catch (_) {}
 
-    // Procura um objeto JSON balanceando chaves.
+    // JSON embutido.
     const objectText =
       this.extractBalancedJson(
-        clean
+        fenced
       );
 
     if (!objectText) {
@@ -2174,7 +2616,8 @@ ${history}
         JSON.parse(objectText);
 
       return parsed &&
-        typeof parsed === 'object'
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed)
         ? parsed
         : null;
     } catch (_) {
@@ -2182,7 +2625,9 @@ ${history}
     }
   }
 
-  extractBalancedJson(text) {
+  extractBalancedJson(
+    text
+  ) {
     const start =
       text.indexOf('{');
 
@@ -2235,6 +2680,7 @@ ${history}
         character === '{'
       ) {
         depth++;
+        continue;
       }
 
       if (
@@ -2255,20 +2701,153 @@ ${history}
   }
 
   // ============================================================
-  // HISTÓRICO
+  // CONTEXTO
   // ============================================================
+
+  getCurrentStage() {
+    const index =
+      this.sessions.size >= 0
+        ? undefined
+        : undefined;
+
+    // O índice é obtido pela sessão nos
+    // métodos que chamam esta função.
+    return null;
+  }
+
+  getStageForSession(
+    session
+  ) {
+    return (
+      this.stages[
+        Number(
+          session?.stageIndex || 0
+        )
+      ] ||
+      this.stages[
+        this.stages.length - 1
+      ]
+    );
+  }
+
+  getStageAgent(
+    stage
+  ) {
+    return (
+      AGENTS[
+        stage?.agent
+      ] ||
+      AGENTS.recruiter
+    );
+  }
+
+  getTone(session) {
+    return (
+      SIMPLE_TONE[
+        session?.languageLevel
+      ] ||
+      SIMPLE_TONE.simple
+    );
+  }
+
+  getJobContext(session) {
+    return {
+      companyName:
+        session.getCompanyName(),
+      jobTitle:
+        session.getJobTitle(),
+    };
+  }
+
+  buildInterviewContext(
+    session
+  ) {
+    const stage =
+      this.getStageForSession(
+        session
+      );
+
+    const history =
+      this.getRecentHistoryText(
+        session,
+        DEFAULT_HISTORY_LIMIT
+      );
+
+    const coveredTopics =
+      (
+        session.topicsCovered ||
+        []
+      )
+        .filter(Boolean)
+        .join('; ') ||
+      'nenhum ainda';
+
+    const askedQuestions =
+      Array.from(
+        session.askedQuestions ||
+          []
+      )
+        .slice(-MAX_RECENT_QUESTIONS)
+        .join(' | ') ||
+      'nenhuma';
+
+    return {
+      stage,
+      companyName:
+        session.getCompanyName(),
+      jobTitle:
+        session.getJobTitle(),
+      candidateName:
+        session.candidateName ||
+        'Candidato',
+      languageLevel:
+        session.languageLevel ||
+        'simple',
+      lastQuestion:
+        session.lastQuestion ||
+        '',
+      coveredTopics,
+      askedQuestions,
+      history,
+      overusedWords:
+        this.getOverusedWords(
+          session
+        ),
+    };
+  }
+
+  // Compatibilidade: vários métodos
+  // chamam getCurrentStage(session).
+  get currentStage() {
+    return null;
+  }
+
+  formatList(items) {
+    if (!Array.isArray(items) || !items.length) {
+      return 'Não especificadas.';
+    }
+
+    return items
+      .filter(Boolean)
+      .map(
+        (item) =>
+          `- ${item}`
+      )
+      .join('\n');
+  }
 
   getRecentHistoryText(
     session,
-    limit = 6
+    limit = DEFAULT_HISTORY_LIMIT
   ) {
-    return session.conversationHistory
+    return (
+      session.conversationHistory || []
+    )
       .slice(-limit)
       .map(
         (message) =>
           `${
-            message.role ===
-            'assistant'
+            message.role === 'assistant'
               ? 'Recrutador'
               : 'Candidato'
           }: ${message.content}`
@@ -2282,32 +2861,32 @@ ${history}
 
   firstName(session) {
     return (
-      String(
-        session.candidateName || ''
+      clean(
+        session.candidateName
       )
         .split(/\s+/)[0] ||
-      'colega'
+      'candidato'
     );
   }
 
   isCancelIntent(text) {
     const value =
-      String(text || '')
-        .toLowerCase()
-        .trim();
+      clean(text).toLowerCase();
 
-    if (value.length > 80) {
+    if (
+      value.length > 80
+    ) {
       return false;
     }
 
     return (
-      /(quero (cancelar|sair|desistir|parar))/.test(
+      /quero (cancelar|sair|desistir|parar)/.test(
         value
       ) ||
       /^(cancelar|desistir|sair|encerrar|abortar)$/.test(
         value
       ) ||
-      /n[ãa]o quero continuar/.test(
+      /não quero continuar/.test(
         value
       ) ||
       /^desisto$/.test(value)
@@ -2315,22 +2894,22 @@ ${history}
   }
 
   isTooShort(text) {
-    const tokenCount =
-      String(text || '')
-        .trim()
+    const tokens =
+      clean(text)
         .split(/\s+/)
-        .filter(Boolean)
-        .length;
+        .filter(Boolean);
 
     return (
-      tokenCount <= 3 &&
-      !/\?/.test(text)
+      tokens.length <= 3 &&
+      !/[?؟]$/.test(
+        clean(text)
+      )
     );
   }
 
   normalizeName(text) {
-    const cleaned =
-      String(text || '')
+    let value =
+      clean(text)
         .replace(
           /^(o\s+meu\s+nome\s+[ée]|me\s+chamo|chamo-me|sou\s+o|sou\s+a|sou)\s+/i,
           ''
@@ -2342,14 +2921,14 @@ ${history}
         .trim();
 
     if (
-      cleaned.length < 2 ||
-      cleaned.length > 60
+      value.length < 2 ||
+      value.length > 80
     ) {
       return null;
     }
 
     const parts =
-      cleaned
+      value
         .split(/\s+/)
         .filter(Boolean);
 
@@ -2359,18 +2938,27 @@ ${history}
 
     return parts
       .map(
-        (word) =>
-          word.charAt(0).toUpperCase() +
-          word
-            .slice(1)
-            .toLowerCase()
+        (word) => {
+          const normalized =
+            word.toLowerCase();
+
+          return (
+            normalized.charAt(0)
+              .toUpperCase() +
+            normalized.slice(1)
+          );
+        }
       )
       .join(' ');
   }
 
-  calculateFinalScore(session) {
+  calculateFinalScore(
+    session
+  ) {
     if (
-      !Array.isArray(session.scores) ||
+      !Array.isArray(
+        session.scores
+      ) ||
       !session.scores.length
     ) {
       return 0;
@@ -2378,8 +2966,16 @@ ${history}
 
     const total =
       session.scores.reduce(
-        (sum, score) =>
-          sum + Number(score.score || 0),
+        (
+          sum,
+          score
+        ) =>
+          sum +
+          clamp(
+            score?.score,
+            0,
+            10
+          ),
         0
       );
 
@@ -2392,11 +2988,15 @@ ${history}
   determineResult(
     averageScore
   ) {
-    if (averageScore >= 8) {
+    if (
+      averageScore >= 8
+    ) {
       return 'Excelente';
     }
 
-    if (averageScore >= 6) {
+    if (
+      averageScore >= 6
+    ) {
       return 'Bom';
     }
 
@@ -2405,7 +3005,7 @@ ${history}
 
   isValidEmail(email) {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-      String(email || '').trim()
+      clean(email)
     );
   }
 
@@ -2424,18 +3024,20 @@ ${history}
     }
   }
 
-  clearQuestionCollection(userId) {
+  clearQuestionCollection(
+    userId
+  ) {
     this.questionCollector.delete(
       userId
     );
 
-    if (
-      this.collectorTimers.has(userId)
-    ) {
-      clearTimeout(
-        this.collectorTimers.get(userId)
+    const timer =
+      this.collectorTimers.get(
+        userId
       );
 
+    if (timer) {
+      clearTimeout(timer);
       this.collectorTimers.delete(
         userId
       );

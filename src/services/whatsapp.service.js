@@ -28,6 +28,7 @@ const READ_STATUS_DEBOUNCE = 5000;
 const STATUS_BROADCAST = 'status@broadcast';
 const WHATSAPP_SUFFIX = '@s.whatsapp.net';
 const GROUP_SUFFIX = '@g.us';
+const LID_SUFFIX = '@lid';
 
 class WhatsAppService extends BaseService {
   constructor(interviewService) {
@@ -83,7 +84,7 @@ class WhatsAppService extends BaseService {
   }
 
   // ============================================================
-  // NORMALIZAÇÃO DE TELEFONE
+  // NORMALIZAÇÃO DE TELEFONE E JID
   // ============================================================
 
   normalizePhone(phone) {
@@ -100,18 +101,12 @@ class WhatsAppService extends BaseService {
       return '';
     }
 
-    // Exemplo:
-    // 841234567 -> 258841234567
+    // Exemplo: 841234567 -> 258841234567
     if (clean.length === 9) {
       clean = `${this.defaultCountryCode}${clean}`;
     }
-
-    // Exemplo:
-    // 0841234567 -> 258841234567
-    else if (
-      clean.length === 10 &&
-      clean.startsWith('0')
-    ) {
+    // Exemplo: 0841234567 -> 258841234567
+    else if (clean.length === 10 && clean.startsWith('0')) {
       clean = `${this.defaultCountryCode}${clean.slice(1)}`;
     }
 
@@ -125,16 +120,16 @@ class WhatsAppService extends BaseService {
 
     const value = String(to).trim();
 
-    // Grupo
-    if (value.endsWith(GROUP_SUFFIX)) {
+    // Preserva JIDs nativos do WhatsApp (@s.whatsapp.net, @g.us e @lid)
+    if (
+      value.endsWith(GROUP_SUFFIX) ||
+      value.endsWith(WHATSAPP_SUFFIX) ||
+      value.endsWith(LID_SUFFIX)
+    ) {
       return value;
     }
 
-    // JID já normalizado
-    if (value.endsWith(WHATSAPP_SUFFIX)) {
-      return value;
-    }
-
+    // Sanitiza e normaliza números de telefone convencionais
     const phone = this.normalizePhone(value);
 
     if (!phone) {
@@ -142,6 +137,18 @@ class WhatsAppService extends BaseService {
     }
 
     return `${phone}${WHATSAPP_SUFFIX}`;
+  }
+
+  formatLogRecipient(chatId) {
+    if (!chatId) {
+      return '';
+    }
+
+    if (chatId.endsWith(WHATSAPP_SUFFIX)) {
+      return `+${chatId.split('@')[0]}`;
+    }
+
+    return chatId;
   }
 
   // ============================================================
@@ -165,21 +172,17 @@ class WhatsAppService extends BaseService {
       this.ensureAuthDirectory();
 
       const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-
       const { version } = await fetchLatestBaileysVersion();
 
       this.socket = makeWASocket({
         version,
         auth: state,
         logger: this.logger,
-
         browser: ['Yane ATS', 'Chrome', '120.0.0.0'],
-
         printQRInTerminal: false,
         syncFullHistory: false,
         markOnlineOnConnect: true,
         generateHighQualityLinkPreview: false,
-
         defaultQueryTimeoutMs: CONNECTION_TIMEOUT,
       });
 
@@ -192,13 +195,11 @@ class WhatsAppService extends BaseService {
       this.setupEventHandlers(saveCreds);
 
       this.log('Socket WhatsApp criado. Aguardando conexão...');
-
     } catch (error) {
       this.isConnecting = false;
       this.isReady = false;
 
       this.logError('Erro ao inicializar WhatsApp.', error);
-
       this.scheduleReconnect();
     }
   }
@@ -212,30 +213,21 @@ class WhatsAppService extends BaseService {
       throw new Error('Socket WhatsApp não inicializado.');
     }
 
-    this.socket.ev.on(
-      'connection.update',
-      (update) => this.handleConnectionUpdate(update)
+    this.socket.ev.on('connection.update', (update) =>
+      this.handleConnectionUpdate(update)
     );
 
-    this.socket.ev.on(
-      'creds.update',
-      saveCreds
+    this.socket.ev.on('creds.update', saveCreds);
+
+    this.socket.ev.on('messages.upsert', (event) =>
+      this.handleMessagesUpsert(event)
     );
 
-    this.socket.ev.on(
-      'messages.upsert',
-      (event) => this.handleMessagesUpsert(event)
+    this.socket.ev.on('messages.update', (updates) =>
+      this.handleMessagesUpdate(updates)
     );
 
-    this.socket.ev.on(
-      'messages.update',
-      (updates) => this.handleMessagesUpdate(updates)
-    );
-
-    this.socket.ev.on(
-      'presence.update',
-      () => {}
-    );
+    this.socket.ev.on('presence.update', () => {});
   }
 
   // ============================================================
@@ -243,11 +235,7 @@ class WhatsAppService extends BaseService {
   // ============================================================
 
   async handleConnectionUpdate(update) {
-    const {
-      connection,
-      lastDisconnect,
-      qr,
-    } = update;
+    const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       this.handleQRCode(qr);
@@ -295,23 +283,16 @@ class WhatsAppService extends BaseService {
 
   async handleConnectionClose(lastDisconnect) {
     const statusCode = this.getDisconnectStatusCode(lastDisconnect);
-
-    const loggedOut =
-      statusCode === DisconnectReason.loggedOut;
+    const loggedOut = statusCode === DisconnectReason.loggedOut;
 
     this.isReady = false;
     this.isConnecting = false;
     this.qrCode = null;
 
-    this.log(
-      `WhatsApp desconectado. Código: ${statusCode || 'desconhecido'}`
-    );
+    this.log(`WhatsApp desconectado. Código: ${statusCode || 'desconhecido'}`);
 
     if (loggedOut) {
-      this.log(
-        'Sessão encerrada pelo WhatsApp. Limpando credenciais locais.'
-      );
-
+      this.log('Sessão encerrada pelo WhatsApp. Limpando credenciais locais.');
       this.clearAuthDirectory();
       return;
     }
@@ -337,9 +318,7 @@ class WhatsAppService extends BaseService {
     }
 
     if (this.retryCount >= MAX_RETRIES) {
-      this.logError(
-        `Número máximo de tentativas atingido (${MAX_RETRIES}).`
-      );
+      this.logError(`Número máximo de tentativas atingido (${MAX_RETRIES}).`);
       return;
     }
 
@@ -386,10 +365,7 @@ class WhatsAppService extends BaseService {
         await this.processIncomingMessage(message);
       }
     } catch (error) {
-      this.logError(
-        'Erro ao processar lote de mensagens.',
-        error
-      );
+      this.logError('Erro ao processar lote de mensagens.', error);
     }
   }
 
@@ -414,19 +390,14 @@ class WhatsAppService extends BaseService {
       return;
     }
 
-    const preview = parsed.text.length > 100
-      ? `${parsed.text.substring(0, 100)}...`
-      : parsed.text;
+    const preview =
+      parsed.text.length > 100
+        ? `${parsed.text.substring(0, 100)}...`
+        : parsed.text;
 
-    this.log(
-      `Mensagem recebida de [${from}]: "${preview}"`
-    );
+    this.log(`Mensagem recebida de [${from}]: "${preview}"`);
 
-    await this.handleMessage(
-      from,
-      parsed.text,
-      parsed.isButtonClick
-    );
+    await this.handleMessage(from, parsed.text, parsed.isButtonClick);
   }
 
   // ============================================================
@@ -469,7 +440,6 @@ class WhatsAppService extends BaseService {
           response.displayText ||
           ''
         ).trim(),
-
         isButtonClick: true,
       };
     }
@@ -485,12 +455,7 @@ class WhatsAppService extends BaseService {
 
     if (nativeFlow) {
       return {
-        text: (
-          nativeFlow.text ||
-          nativeFlow.paramsJson ||
-          ''
-        ).trim(),
-
+        text: (nativeFlow.text || nativeFlow.paramsJson || '').trim(),
         isButtonClick: true,
       };
     }
@@ -499,12 +464,7 @@ class WhatsAppService extends BaseService {
 
     if (selectedButton) {
       return {
-        text: (
-          selectedButton.displayText ||
-          selectedButton.id ||
-          ''
-        ).trim(),
-
+        text: (selectedButton.displayText || selectedButton.id || '').trim(),
         isButtonClick: true,
       };
     }
@@ -543,14 +503,9 @@ class WhatsAppService extends BaseService {
       return;
     }
 
-    this.lastReadTimestamps.set(
-      from,
-      Date.now()
-    );
+    this.lastReadTimestamps.set(from, Date.now());
 
-    this.log(
-      `Mensagem ${messageId} lida por ${from}`
-    );
+    this.log(`Mensagem ${messageId} lida por ${from}`);
 
     await this.notifyBackendMessageRead({
       phone: from,
@@ -565,26 +520,18 @@ class WhatsAppService extends BaseService {
       return false;
     }
 
-    return (
-      Date.now() - lastRead <
-      READ_STATUS_DEBOUNCE
-    );
+    return Date.now() - lastRead < READ_STATUS_DEBOUNCE;
   }
 
-  async notifyBackendMessageRead({
-    phone,
-    messageId,
-  }) {
+  async notifyBackendMessageRead({ phone, messageId }) {
     try {
       const response = await fetch(
         `${this.yaneApiUrl}/webhooks/message-status`,
         {
           method: 'POST',
-
           headers: {
             'Content-Type': 'application/json',
           },
-
           body: JSON.stringify({
             phone,
             message_id: messageId,
@@ -600,10 +547,7 @@ class WhatsAppService extends BaseService {
         );
       }
     } catch (error) {
-      this.logError(
-        'Erro ao enviar status de leitura para o backend.',
-        error
-      );
+      this.logError('Erro ao enviar status de leitura para o backend.', error);
     }
   }
 
@@ -628,24 +572,15 @@ class WhatsAppService extends BaseService {
     }
 
     try {
-      await this.socket.sendMessage(
-        chatId,
-        {
-          text: String(message),
-        }
-      );
+      await this.socket.sendMessage(chatId, {
+        text: String(message),
+      });
 
-      this.log(
-        `Mensagem enviada para +${chatId.split('@')[0]}`
-      );
+      this.log(`Mensagem enviada para ${this.formatLogRecipient(chatId)}`);
 
       return true;
     } catch (error) {
-      this.logError(
-        `Erro ao enviar mensagem para ${to}.`,
-        error
-      );
-
+      this.logError(`Erro ao enviar mensagem para ${to}.`, error);
       return false;
     }
   }
@@ -654,12 +589,7 @@ class WhatsAppService extends BaseService {
   // MENSAGEM INTERATIVA
   // ============================================================
 
-  async sendInteractiveMessage(
-    to,
-    title,
-    body,
-    buttons = []
-  ) {
+  async sendInteractiveMessage(to, title, body, buttons = []) {
     const chatId = this.prepareChatId(to);
 
     if (!chatId) {
@@ -671,59 +601,43 @@ class WhatsAppService extends BaseService {
     }
 
     if (!body) {
-      this.logError(
-        'Mensagem interativa sem conteúdo.'
-      );
-
+      this.logError('Mensagem interativa sem conteúdo.');
       return false;
     }
 
     try {
-      const interactiveButtons =
-        this.buildInteractiveButtons(buttons);
+      const interactiveButtons = this.buildInteractiveButtons(buttons);
 
       if (!interactiveButtons.length) {
         return this.sendMessage(to, body);
       }
 
-      await this.socket.sendMessage(
-        chatId,
-        {
-          interactive: {
-            header: title
-              ? {
-                  title: String(title),
-                }
-              : undefined,
-
-            body: {
-              text: String(body),
-            },
-
-            footer: {
-              text:
-                'Yane ATS - Recrutamento Inteligente',
-            },
-
-            action: {
-              buttons: interactiveButtons,
-            },
-          },
-        }
-      );
+      // Envia os botões utilizando a estrutura limpa suportada pelo Baileys
+      await this.socket.sendMessage(chatId, {
+        text: title ? `*${title}*\n\n${body}` : String(body),
+        footer: 'Yane ATS - Recrutamento Inteligente',
+        buttons: interactiveButtons.map((btn) => ({
+          buttonId: btn.id,
+          buttonText: { displayText: btn.text },
+          type: 1,
+        })),
+        headerType: 1,
+      });
 
       this.log(
-        `Mensagem interativa enviada para +${chatId.split('@')[0]}`
+        `Mensagem interativa enviada para ${this.formatLogRecipient(chatId)}`
       );
 
       return true;
     } catch (error) {
       this.logError(
-        `Erro ao enviar mensagem interativa para ${to}.`,
+        `Erro ao enviar mensagem interativa para ${to}. Enviando fallback em texto...`,
         error
       );
 
-      return false;
+      // Fallback: envia mensagem formatada em texto caso os botões falhem
+      const fallbackText = `${title ? `*${title}*\n\n` : ''}${body}`;
+      return this.sendMessage(to, fallbackText);
     }
   }
 
@@ -735,16 +649,8 @@ class WhatsAppService extends BaseService {
     return buttons
       .filter(Boolean)
       .map((button, index) => ({
-        id:
-          button.id ||
-          `btn_${index + 1}`,
-
-        text:
-          button.text ||
-          button.label ||
-          `Opção ${index + 1}`,
-
-        type: 'reply',
+        id: button.id || `btn_${index + 1}`,
+        text: button.text || button.label || `Opção ${index + 1}`,
       }));
   }
 
@@ -752,21 +658,15 @@ class WhatsAppService extends BaseService {
   // PROCESSAMENTO DA CONVERSA
   // ============================================================
 
-  async handleMessage(
-    from,
-    text,
-    isButton = false
-  ) {
+  async handleMessage(from, text, isButton = false) {
     if (!from) {
       return;
     }
 
-    const normalizedText =
-      String(text || '').trim();
+    const normalizedText = String(text || '').trim();
 
     try {
-      const hasActiveSession =
-        !!this.interviewService.getSession(from);
+      const hasActiveSession = !!this.interviewService.getSession(from);
 
       // --------------------------------------------------------
       // RESET
@@ -787,22 +687,14 @@ class WhatsAppService extends BaseService {
       // INÍCIO DA ENTREVISTA
       // --------------------------------------------------------
 
-      if (
-        !hasActiveSession &&
-        this.isStartTrigger(normalizedText, isButton)
-      ) {
-        this.log(
-          `[SESSAO] A iniciar entrevista para ${from}...`
-        );
+      if (!hasActiveSession && this.isStartTrigger(normalizedText, isButton)) {
+        this.log(`[SESSAO] A iniciar entrevista para ${from}...`);
 
-        const welcome =
-          await this.interviewService.startInterview(from);
+        const welcome = await this.interviewService.startInterview(from);
 
-        if (welcome) {
-          await this.sendMessage(
-            from,
-            welcome
-          );
+        // Apenas envia a mensagem se startInterview retornar uma string e não tiver enviado internamente
+        if (typeof welcome === 'string' && welcome.trim().length > 0) {
+          await this.sendMessage(from, welcome);
         }
 
         return;
@@ -813,21 +705,15 @@ class WhatsAppService extends BaseService {
       // --------------------------------------------------------
 
       if (hasActiveSession) {
-        this.log(
-          `[SESSAO] A processar resposta para ${from}...`
+        this.log(`[SESSAO] A processar resposta para ${from}...`);
+
+        const response = await this.interviewService.handleResponse(
+          from,
+          normalizedText
         );
 
-        const response =
-          await this.interviewService.handleResponse(
-            from,
-            normalizedText
-          );
-
-        if (response) {
-          await this.sendMessage(
-            from,
-            response
-          );
+        if (response && typeof response === 'string' && response.trim()) {
+          await this.sendMessage(from, response);
         }
 
         return;
@@ -837,14 +723,9 @@ class WhatsAppService extends BaseService {
       // SEM SESSÃO
       // --------------------------------------------------------
 
-      this.log(
-        `[BOT] Mensagem ignorada de ${from}: nenhuma sessão ativa.`
-      );
+      this.log(`[BOT] Mensagem ignorada de ${from}: nenhuma sessão ativa.`);
     } catch (error) {
-      this.logError(
-        `Erro ao processar mensagem de ${from}.`,
-        error
-      );
+      this.logError(`Erro ao processar mensagem de ${from}.`, error);
 
       await this.sendMessage(
         from,
@@ -854,10 +735,9 @@ class WhatsAppService extends BaseService {
   }
 
   isResetCommand(text) {
-    const normalized =
-      String(text || '')
-        .toLowerCase()
-        .trim();
+    const normalized = String(text || '')
+      .toLowerCase()
+      .trim();
 
     return (
       normalized === '!reset' ||
@@ -879,10 +759,7 @@ class WhatsAppService extends BaseService {
       return false;
     }
 
-    const cleanText =
-      text
-        .toLowerCase()
-        .trim();
+    const cleanText = text.toLowerCase().trim();
 
     const triggers = [
       /^sim\b/,
@@ -904,9 +781,7 @@ class WhatsAppService extends BaseService {
       /^comecar\b/,
     ];
 
-    return triggers.some(
-      (regex) => regex.test(cleanText)
-    );
+    return triggers.some((regex) => regex.test(cleanText));
   }
 
   isExplicitStartText(text) {
@@ -914,10 +789,7 @@ class WhatsAppService extends BaseService {
       return false;
     }
 
-    const cleanText =
-      text
-        .toLowerCase()
-        .trim();
+    const cleanText = text.toLowerCase().trim();
 
     return [
       'iniciar',
@@ -935,43 +807,25 @@ class WhatsAppService extends BaseService {
   // ============================================================
 
   getStatus() {
-    const connected =
-      Boolean(
-        this.isReady &&
-        this.socket?.user?.id
-      );
+    const connected = Boolean(this.isReady && this.socket?.user?.id);
 
     return {
       connected,
-
-      qr_code:
-        this.qrCode,
-
-      session:
-        this.socket?.user?.id
-          ?.split(':')[0] ||
-        null,
-
-      message:
-        connected
-          ? 'WhatsApp conectado e pronto'
-          : this.qrCode
-            ? 'Aguardando escaneamento do QR Code'
-            : this.isConnecting
-              ? 'A iniciar sessão...'
-              : 'WhatsApp desconectado',
+      qr_code: this.qrCode,
+      session: this.socket?.user?.id?.split(':')[0] || null,
+      message: connected
+        ? 'WhatsApp conectado e pronto'
+        : this.qrCode
+          ? 'Aguardando escaneamento do QR Code'
+          : this.isConnecting
+            ? 'A iniciar sessão...'
+            : 'WhatsApp desconectado',
     };
   }
 
   ensureReady() {
-    if (
-      !this.isReady ||
-      !this.socket
-    ) {
-      this.log(
-        'WhatsApp não está pronto para enviar mensagens.'
-      );
-
+    if (!this.isReady || !this.socket) {
+      this.log('WhatsApp não está pronto para enviar mensagens.');
       return false;
     }
 
@@ -979,14 +833,10 @@ class WhatsAppService extends BaseService {
   }
 
   prepareChatId(to) {
-    const chatId =
-      this.getChatId(to);
+    const chatId = this.getChatId(to);
 
     if (!chatId) {
-      this.logError(
-        `Número/JID inválido: ${to}`
-      );
-
+      this.logError(`Número/JID inválido: ${to}`);
       return '';
     }
 
@@ -1001,8 +851,7 @@ class WhatsAppService extends BaseService {
     if (this.isConnecting) {
       return {
         success: false,
-        message:
-          'Já existe uma operação de conexão em andamento.',
+        message: 'Já existe uma operação de conexão em andamento.',
       };
     }
 
@@ -1010,7 +859,6 @@ class WhatsAppService extends BaseService {
 
     try {
       this.clearRetryTimer();
-
       await this.closeSocket();
 
       this.resetConnectionState();
@@ -1031,10 +879,7 @@ class WhatsAppService extends BaseService {
     } catch (error) {
       this.isConnecting = false;
 
-      this.logError(
-        'Erro ao reiniciar sessão do WhatsApp.',
-        error
-      );
+      this.logError('Erro ao reiniciar sessão do WhatsApp.', error);
 
       return {
         success: false,
@@ -1053,10 +898,7 @@ class WhatsAppService extends BaseService {
         this.socket.ws.close();
       }
     } catch (error) {
-      this.logError(
-        'Erro ao fechar socket WhatsApp.',
-        error
-      );
+      this.logError('Erro ao fechar socket WhatsApp.', error);
     } finally {
       this.socket = null;
       this.store = null;
@@ -1073,19 +915,13 @@ class WhatsAppService extends BaseService {
   clearAuthDirectory() {
     try {
       if (fs.existsSync(AUTH_DIR)) {
-        fs.rmSync(
-          AUTH_DIR,
-          {
-            recursive: true,
-            force: true,
-          }
-        );
+        fs.rmSync(AUTH_DIR, {
+          recursive: true,
+          force: true,
+        });
       }
     } catch (error) {
-      this.logError(
-        'Erro ao limpar diretório de autenticação.',
-        error
-      );
+      this.logError('Erro ao limpar diretório de autenticação.', error);
     }
   }
 
@@ -1094,9 +930,7 @@ class WhatsAppService extends BaseService {
   // ============================================================
 
   delay(ms) {
-    return new Promise(
-      (resolve) => setTimeout(resolve, ms)
-    );
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   getClient() {
@@ -1113,13 +947,10 @@ class WhatsAppService extends BaseService {
         `[WHATSAPP] ${message}`,
         error?.stack || error?.message || error
       );
-
       return;
     }
 
-    console.error(
-      `[WHATSAPP] ${message}`
-    );
+    console.error(`[WHATSAPP] ${message}`);
   }
 }
 
