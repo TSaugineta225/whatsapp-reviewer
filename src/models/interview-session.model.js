@@ -3,15 +3,45 @@
 const { INTERVIEW_CONFIG } = require('../config/interview');
 
 // ============================================================
-// DEFAULTS
+// CONSTANTES
 // ============================================================
 
-const DEFAULT_TIMEOUT_MINUTES = INTERVIEW_CONFIG.timeoutMinutes || 20;
+const DEFAULT_TIMEOUT_MINUTES =
+  Number(INTERVIEW_CONFIG.timeoutMinutes) || 20;
+
 const DEFAULT_HISTORY_LIMIT = 6;
 const DEFAULT_LANGUAGE_LEVEL = 'simple';
 const DEFAULT_STAGE = 'initial';
 
-const DEFAULT_TIMEOUT_MS = DEFAULT_TIMEOUT_MINUTES * 60 * 1000;
+const DEFAULT_TIMEOUT_MS =
+  DEFAULT_TIMEOUT_MINUTES * 60 * 1000;
+
+const DEFAULT_SCORE = 0;
+const MAX_SCORE = 10;
+
+const LANGUAGE_LEVELS = Object.freeze({
+  SIMPLE: 'simple',
+  MEDIUM: 'medium',
+  ADVANCED: 'advanced',
+});
+
+const COMPLEX_WORDS = [
+  'especificamente',
+  'adicionalmente',
+  'particularmente',
+  'consideravelmente',
+  'significativamente',
+  'simultaneamente',
+  'consequentemente',
+  'alternativamente',
+  'fundamentalmente',
+  'substantivamente',
+];
+
+const COMPLEX_WORDS_PATTERN = new RegExp(
+  `\\b(?:${COMPLEX_WORDS.join('|')})\\b`,
+  'i'
+);
 
 // ============================================================
 // MODEL
@@ -24,9 +54,7 @@ class InterviewSession {
     this._initializeIdentity();
     this._initializeInterviewState();
     this._initializeConversationState();
-    this._initializeEvaluationState();
     this._initializeTimingState();
-    this._initializeIntegrationState();
   }
 
   // ==========================================================
@@ -36,8 +64,8 @@ class InterviewSession {
   _initializeIdentity() {
     this.candidateName = null;
     this.candidateEmail = null;
-    this.jobTitle = null;
 
+    this.jobTitle = null;
     this.company = null;
     this.jobVacancy = null;
 
@@ -64,6 +92,7 @@ class InterviewSession {
 
     this.offTopicAttempts = 0;
     this.shortAnswerStreak = 0;
+
     this.qaOffered = false;
   }
 
@@ -72,18 +101,13 @@ class InterviewSession {
     this.conversationHistory = [];
 
     this.usedOpeners = [];
-    this.usedWords = {};
+    this.usedWords = Object.create(null);
 
     this.ackStreak = 0;
     this.turnCount = 0;
 
-    this.languageLevel = DEFAULT_LANGUAGE_LEVEL;
-  }
-
-  _initializeEvaluationState() {
-    // Reservado para evolução futura da avaliação.
-    // Mantido separado para evitar misturar estado de conversa
-    // com estado de entrevista.
+    this.languageLevel =
+      DEFAULT_LANGUAGE_LEVEL;
   }
 
   _initializeTimingState() {
@@ -92,17 +116,13 @@ class InterviewSession {
     this.startTime = now;
     this.lastInteraction = now;
 
+    this.timeoutDuration =
+      DEFAULT_TIMEOUT_MS;
+
     this.timeoutTimer = null;
-    this.timeoutDuration = DEFAULT_TIMEOUT_MS;
 
     this.timeoutWarningSent = false;
     this.timeoutWarningTime = null;
-  }
-
-  _initializeIntegrationState() {
-    // Os valores são definidos em _initializeIdentity().
-    // Este método existe apenas para deixar explícita a separação
-    // entre estado da entrevista e integrações externas.
   }
 
   // ==========================================================
@@ -111,15 +131,35 @@ class InterviewSession {
 
   updateLastInteraction() {
     this.lastInteraction = Date.now();
+
+    return this.lastInteraction;
   }
 
-  isExpired() {
-    return Date.now() - this.lastInteraction > this.timeoutDuration;
+  isExpired(now = Date.now()) {
+    if (!this.lastInteraction) {
+      return false;
+    }
+
+    return (
+      now - this.lastInteraction >
+      this.timeoutDuration
+    );
+  }
+
+  getTimeSinceLastInteraction() {
+    return Math.max(
+      0,
+      Date.now() - this.lastInteraction
+    );
   }
 
   getDuration() {
-    return Math.floor(
-      (Date.now() - this.startTime) / 60000
+    return Math.max(
+      0,
+      Math.floor(
+        (Date.now() - this.startTime) /
+          60000
+      )
     );
   }
 
@@ -134,21 +174,40 @@ class InterviewSession {
 
     this.timeoutTimer = setTimeout(() => {
       this.timeoutTimer = null;
-      callback(this);
+
+      try {
+        const result = callback(this);
+
+        // Permite callbacks assíncronos sem gerar
+        // uma Promise rejeitada não tratada.
+        if (
+          result &&
+          typeof result.catch === 'function'
+        ) {
+          result.catch(() => {});
+        }
+      } catch (error) {
+        // O callback é responsabilidade do serviço.
+        // Aqui apenas evitamos quebrar o timer.
+      }
     }, this.timeoutDuration);
+
+    return this.timeoutTimer;
   }
 
   resetTimeout(callback) {
-    this.scheduleTimeout(callback);
+    return this.scheduleTimeout(callback);
   }
 
   cancelTimeout() {
     if (!this.timeoutTimer) {
-      return;
+      return false;
     }
 
     clearTimeout(this.timeoutTimer);
     this.timeoutTimer = null;
+
+    return true;
   }
 
   // ==========================================================
@@ -157,8 +216,8 @@ class InterviewSession {
 
   hasBasicInfo() {
     return Boolean(
-      this.candidateEmail &&
-      this.candidateName
+      this.candidateName?.trim() &&
+      this.candidateEmail?.trim()
     );
   }
 
@@ -170,12 +229,28 @@ class InterviewSession {
     };
   }
 
+  setCandidateInfo({
+    name = null,
+    email = null,
+  } = {}) {
+    this.candidateName =
+      this._cleanNullable(name);
+
+    this.candidateEmail =
+      this._cleanNullable(email);
+
+    return this;
+  }
+
   // ==========================================================
   // CONTEXTO DA VAGA / EMPRESA
   // ==========================================================
 
   getCompanyName() {
-    return this.company?.name || 'Empresa';
+    return (
+      this.company?.name ||
+      'Empresa'
+    );
   }
 
   getJobTitle() {
@@ -184,6 +259,120 @@ class InterviewSession {
       this.jobTitle ||
       'Vaga'
     );
+  }
+
+  setJobContext({
+    jobTitle = null,
+    company = null,
+    jobVacancy = null,
+  } = {}) {
+    if (jobTitle != null) {
+      this.jobTitle = jobTitle;
+    }
+
+    if (company != null) {
+      this.company = company;
+    }
+
+    if (jobVacancy != null) {
+      this.jobVacancy = jobVacancy;
+    }
+
+    return this;
+  }
+
+  // ==========================================================
+  // ESTÁGIO
+  // ==========================================================
+
+  getCurrentStageIndex() {
+    return this.stageIndex;
+  }
+
+  setStage(index, stageId = null) {
+    const normalizedIndex = Math.max(
+      0,
+      Number(index) || 0
+    );
+
+    this.stageIndex = normalizedIndex;
+
+    if (stageId) {
+      this.stage = String(stageId);
+    }
+
+    this.questionCounter = 0;
+    this.currentQuestion = 0;
+    this.offTopicAttempts = 0;
+    this.shortAnswerStreak = 0;
+
+    return this;
+  }
+
+  advanceStage(stageId = null) {
+    this.stageIndex += 1;
+
+    this.stage =
+      stageId ||
+      this.stage ||
+      DEFAULT_STAGE;
+
+    this.questionCounter = 0;
+    this.currentQuestion = 0;
+    this.offTopicAttempts = 0;
+    this.shortAnswerStreak = 0;
+
+    return this;
+  }
+
+  // ==========================================================
+  // PERGUNTAS
+  // ==========================================================
+
+  getQuestionCount() {
+    return this.askedQuestions.size;
+  }
+
+  registerQuestion(question) {
+    const normalizedQuestion =
+      this._cleanNullable(question);
+
+    if (!normalizedQuestion) {
+      return false;
+    }
+
+    this.lastQuestion =
+      normalizedQuestion;
+
+    this.askedQuestions.add(
+      normalizedQuestion
+    );
+
+    this.currentQuestion += 1;
+    this.questionCounter += 1;
+
+    return true;
+  }
+
+  hasAskedQuestion(question) {
+    if (!question) {
+      return false;
+    }
+
+    return this.askedQuestions.has(
+      String(question).trim()
+    );
+  }
+
+  getLastQuestion() {
+    return this.lastQuestion;
+  }
+
+  setLastQuestion(question) {
+    this.lastQuestion =
+      this._cleanNullable(question);
+
+    return this.lastQuestion;
   }
 
   // ==========================================================
@@ -195,15 +384,24 @@ class InterviewSession {
       stage: this.stage,
       stageIndex: this.stageIndex,
 
-      // Mantido como índice humano para compatibilidade.
-      questionNumber: this.currentQuestion + 1,
+      questionNumber:
+        this.questionCounter + 1,
 
-      // Número de perguntas já registadas.
-      totalQuestions: this.askedQuestions.size,
+      currentQuestion:
+        this.currentQuestion,
 
-      scores: this.scores,
+      totalQuestions:
+        this.askedQuestions.size,
+
+      scores: [...this.scores],
+
       duration: this.getDuration(),
-      inQASection: this.inQASection,
+
+      inQASection:
+        this.inQASection,
+
+      turnCount:
+        this.turnCount,
     };
   }
 
@@ -216,81 +414,217 @@ class InterviewSession {
       return 0;
     }
 
-    const total = this.scores.reduce(
-      (sum, item) => sum + this._normalizeScore(item.score),
-      0
-    );
+    const total =
+      this.scores.reduce(
+        (sum, item) =>
+          sum +
+          this._normalizeScore(
+            item.score
+          ),
+        0
+      );
 
-    return total / this.scores.length;
+    return (
+      total / this.scores.length
+    );
+  }
+
+  getLatestScore() {
+    return (
+      this.scores.length
+        ? this.scores[
+            this.scores.length - 1
+          ]
+        : null
+    );
   }
 
   addScore(score = {}) {
-    this.scores.push({
-      score: this._normalizeScore(score.score),
-      clarity: this._normalizeScore(score.clarity),
-      relevance: this._normalizeScore(score.relevance),
-      depth: this._normalizeScore(score.depth),
+    const normalizedScore = {
+      score: this._normalizeScore(
+        score.score
+      ),
 
-      feedback: score.feedback || '',
-      question: score.question || '',
-      answer: score.answer || '',
-      emotion: score.emotion || 'neutro',
+      clarity: this._normalizeScore(
+        score.clarity
+      ),
 
-      artificial: Boolean(score.artificial),
-    });
+      relevance: this._normalizeScore(
+        score.relevance
+      ),
+
+      depth: this._normalizeScore(
+        score.depth
+      ),
+
+      feedback:
+        this._cleanString(
+          score.feedback
+        ),
+
+      question:
+        this._cleanString(
+          score.question
+        ),
+
+      answer:
+        this._cleanString(
+          score.answer
+        ),
+
+      emotion:
+        this._cleanString(
+          score.emotion
+        ) || 'neutro',
+
+      artificial:
+        Boolean(score.artificial),
+
+      topic:
+        this._cleanString(
+          score.topic
+        ),
+
+      evidence:
+        this._cleanString(
+          score.evidence
+        ),
+
+      gap:
+        this._cleanString(
+          score.gap
+        ),
+    };
+
+    this.scores.push(
+      normalizedScore
+    );
+
+    return normalizedScore;
   }
 
   _normalizeScore(value) {
-    const numericValue = Number(value);
+    const numericValue =
+      Number(value);
 
-    if (!Number.isFinite(numericValue)) {
-      return 0;
+    if (
+      !Number.isFinite(
+        numericValue
+      )
+    ) {
+      return DEFAULT_SCORE;
     }
 
-    return Math.max(0, Math.min(10, numericValue));
-  }
-
-  // ==========================================================
-  // PERGUNTAS
-  // ==========================================================
-
-  getLastQuestion() {
-    return this.lastQuestion;
-  }
-
-  setLastQuestion(question) {
-    this.lastQuestion =
-      question == null
-        ? null
-        : String(question).trim();
+    return Math.max(
+      DEFAULT_SCORE,
+      Math.min(
+        MAX_SCORE,
+        numericValue
+      )
+    );
   }
 
   // ==========================================================
   // HISTÓRICO
   // ==========================================================
 
-  addToHistory(role, content) {
-    if (!role || content == null) {
-      return;
+  addToHistory(
+    role,
+    content
+  ) {
+    if (
+      !role ||
+      content == null
+    ) {
+      return false;
+    }
+
+    const normalizedContent =
+      this._cleanString(
+        content
+      );
+
+    if (!normalizedContent) {
+      return false;
     }
 
     this.conversationHistory.push({
-      role,
-      content: String(content),
+      role: String(role),
+      content:
+        normalizedContent,
     });
+
+    return true;
   }
 
-  getRecentHistory(limit = DEFAULT_HISTORY_LIMIT) {
-    const normalizedLimit = Math.max(
-      0,
-      Number(limit) || DEFAULT_HISTORY_LIMIT
-    );
+  getRecentHistory(
+    limit = DEFAULT_HISTORY_LIMIT
+  ) {
+    const parsedLimit =
+      Number(limit);
 
-    if (normalizedLimit === 0) {
+    const normalizedLimit =
+      Number.isFinite(parsedLimit)
+        ? Math.max(
+            0,
+            Math.floor(
+              parsedLimit
+            )
+          )
+        : DEFAULT_HISTORY_LIMIT;
+
+    if (
+      normalizedLimit === 0
+    ) {
       return [];
     }
 
-    return this.conversationHistory.slice(-normalizedLimit);
+    return this.conversationHistory.slice(
+      -normalizedLimit
+    );
+  }
+
+  clearHistory() {
+    this.conversationHistory = [];
+
+    return this;
+  }
+
+  // ==========================================================
+  // TÓPICOS
+  // ==========================================================
+
+  addTopic(topic) {
+    const normalizedTopic =
+      this._cleanString(topic);
+
+    if (
+      !normalizedTopic
+    ) {
+      return false;
+    }
+
+    if (
+      !this.topicsCovered.includes(
+        normalizedTopic
+      )
+    ) {
+      this.topicsCovered.push(
+        normalizedTopic
+      );
+    }
+
+    return true;
+  }
+
+  hasCoveredTopic(topic) {
+    if (!topic) {
+      return false;
+    }
+
+    return this.topicsCovered.includes(
+      String(topic).trim()
+    );
   }
 
   // ==========================================================
@@ -298,40 +632,81 @@ class InterviewSession {
   // ==========================================================
 
   registerWords(text) {
-    const words = this._extractMeaningfulWords(text);
+    const extracted =
+      this._extractMeaningfulWords(
+        text
+      );
 
-    for (const word of words) {
+    for (const word of extracted) {
       this.usedWords[word] =
-        (this.usedWords[word] || 0) + 1;
+        (this.usedWords[word] || 0) +
+        1;
     }
+
+    return extracted.length;
   }
 
-  isWordOverused(word, threshold = 3) {
+  isWordOverused(
+    word,
+    threshold = 3
+  ) {
     if (!word) {
       return false;
     }
 
-    const normalizedWord = String(word)
-      .trim()
-      .toLowerCase();
+    const normalizedWord =
+      String(word)
+        .trim()
+        .toLowerCase();
 
-    const normalizedThreshold = Math.max(
-      1,
-      Number(threshold) || 1
-    );
+    const normalizedThreshold =
+      Math.max(
+        1,
+        Number(threshold) || 1
+      );
 
     return (
-      (this.usedWords[normalizedWord] || 0) >=
+      (this.usedWords[
+        normalizedWord
+      ] || 0) >=
       normalizedThreshold
+    );
+  }
+
+  getWordUsage(word) {
+    if (!word) {
+      return 0;
+    }
+
+    const normalizedWord =
+      String(word)
+        .trim()
+        .toLowerCase();
+
+    return (
+      this.usedWords[
+        normalizedWord
+      ] || 0
     );
   }
 
   _extractMeaningfulWords(text) {
     return String(text || '')
       .toLowerCase()
-      .replace(/[^a-zà-ÿ\s]/gi, ' ')
+      .normalize('NFD')
+      .replace(
+        /[\u0300-\u036f]/g,
+        ''
+      )
+      .replace(
+        /[^a-z\s]/g,
+        ' '
+      )
       .split(/\s+/)
-      .filter((word) => word.length > 3);
+      .filter(
+        (word) =>
+          word.length > 3
+      );
   }
 
   // ==========================================================
@@ -339,108 +714,312 @@ class InterviewSession {
   // ==========================================================
 
   updateLanguageLevel(text) {
-    const normalizedText = String(text || '').trim();
+    const normalizedText =
+      this._cleanString(text);
 
     if (!normalizedText) {
-      this.languageLevel = DEFAULT_LANGUAGE_LEVEL;
-      return;
+      return this.languageLevel;
     }
 
-    const words = normalizedText
-      .split(/\s+/)
-      .filter((word) => word.length > 2);
+    const tokens =
+      normalizedText
+        .split(/\s+/)
+        .filter(
+          (word) =>
+            word.length > 2
+        );
 
-    const wordCount = words.length;
+    if (!tokens.length) {
+      return this.languageLevel;
+    }
 
-    const hasComplexWords = /(
-      especificamente|
-      adicionalmente|
-      particularmente|
-      consideravelmente|
-      significativamente|
-      simultaneamente|
-      consequentemente|
-      alternativamente|
-      fundamentalmente|
-      substantivamente
-    )/ix.test(normalizedText);
+    const wordCount =
+      tokens.length;
 
     const sentenceCount =
       normalizedText
         .split(/[.!?]+/)
-        .filter((sentence) => sentence.trim().length > 0)
+        .filter(
+          (sentence) =>
+            sentence.trim()
+              .length > 0
+        )
         .length;
 
     const averageWordsPerSentence =
-      wordCount / Math.max(sentenceCount, 1);
+      wordCount /
+      Math.max(
+        sentenceCount,
+        1
+      );
+
+    const hasComplexWords =
+      COMPLEX_WORDS_PATTERN.test(
+        normalizedText
+      );
 
     if (
       averageWordsPerSentence > 12 ||
       hasComplexWords
     ) {
-      this.languageLevel = 'advanced';
-      return;
+      this.languageLevel =
+        LANGUAGE_LEVELS.ADVANCED;
+    } else if (
+      averageWordsPerSentence > 7
+    ) {
+      this.languageLevel =
+        LANGUAGE_LEVELS.MEDIUM;
+    } else {
+      this.languageLevel =
+        LANGUAGE_LEVELS.SIMPLE;
     }
 
-    if (averageWordsPerSentence > 7) {
-      this.languageLevel = 'medium';
-      return;
-    }
+    return this.languageLevel;
+  }
 
-    this.languageLevel = 'simple';
+  getLanguageLevel() {
+    return this.languageLevel;
+  }
+
+  // ==========================================================
+  // QA / CONTROLO
+  // ==========================================================
+
+  resetShortAnswerState() {
+    this.shortAnswerStreak = 0;
+    return this;
+  }
+
+  resetOffTopicState() {
+    this.offTopicAttempts = 0;
+    return this;
   }
 
   // ==========================================================
   // RESET
   // ==========================================================
 
-  resetState() {
-    // Nunca deixa um timer antigo continuar activo
-    // depois de reiniciar a sessão.
+  resetState({
+    preserveIdentity = true,
+    preserveLanguageLevel = true,
+    preserveInterviewContext = true,
+  } = {}) {
     this.cancelTimeout();
 
-    const persistentState = {
-      userId: this.userId,
+    const identity = preserveIdentity
+      ? {
+          userId:
+            this.userId,
 
-      candidateName: this.candidateName,
-      candidateEmail: this.candidateEmail,
-      jobTitle: this.jobTitle,
+          candidateName:
+            this.candidateName,
 
-      company: this.company,
-      jobVacancy: this.jobVacancy,
+          candidateEmail:
+            this.candidateEmail,
 
-      interviewId: this.interviewId,
-      holdTransactionId: this.holdTransactionId,
-      recruiterId: this.recruiterId,
+          interviewId:
+            this.interviewId,
 
-      languageLevel: this.languageLevel,
-    };
+          holdTransactionId:
+            this.holdTransactionId,
+
+          recruiterId:
+            this.recruiterId,
+        }
+      : {
+          userId: this.userId,
+        };
+
+    const context =
+      preserveInterviewContext
+        ? {
+            jobTitle:
+              this.jobTitle,
+
+            company:
+              this.company,
+
+            jobVacancy:
+              this.jobVacancy,
+          }
+        : {
+            jobTitle: null,
+            company: null,
+            jobVacancy: null,
+          };
+
+    const languageLevel =
+      preserveLanguageLevel
+        ? this.languageLevel
+        : DEFAULT_LANGUAGE_LEVEL;
 
     this._initializeInterviewState();
     this._initializeConversationState();
-
-    // Reinicia o relógio da nova sessão.
     this._initializeTimingState();
 
-    // Mantém os dados que identificam a entrevista/candidato.
-    this.userId = persistentState.userId;
+    // Restaurar dados persistentes.
+    this.userId =
+      identity.userId;
 
-    this.candidateName = persistentState.candidateName;
-    this.candidateEmail = persistentState.candidateEmail;
-    this.jobTitle = persistentState.jobTitle;
+    this.candidateName =
+      identity.candidateName ??
+      null;
 
-    this.company = persistentState.company;
-    this.jobVacancy = persistentState.jobVacancy;
+    this.candidateEmail =
+      identity.candidateEmail ??
+      null;
 
-    this.interviewId = persistentState.interviewId;
+    this.interviewId =
+      identity.interviewId ??
+      null;
+
     this.holdTransactionId =
-      persistentState.holdTransactionId;
-    this.recruiterId = persistentState.recruiterId;
+      identity.holdTransactionId ??
+      null;
+
+    this.recruiterId =
+      identity.recruiterId ??
+      null;
+
+    this.jobTitle =
+      context.jobTitle;
+
+    this.company =
+      context.company;
+
+    this.jobVacancy =
+      context.jobVacancy;
 
     this.languageLevel =
-      persistentState.languageLevel;
+      languageLevel;
 
     return this;
+  }
+
+  // ==========================================================
+  // SERIALIZAÇÃO
+  // ==========================================================
+
+  toJSON() {
+    return {
+      userId: this.userId,
+
+      candidateName:
+        this.candidateName,
+
+      candidateEmail:
+        this.candidateEmail,
+
+      jobTitle:
+        this.jobTitle,
+
+      company:
+        this.company,
+
+      jobVacancy:
+        this.jobVacancy,
+
+      stageIndex:
+        this.stageIndex,
+
+      stage:
+        this.stage,
+
+      currentQuestion:
+        this.currentQuestion,
+
+      questionCounter:
+        this.questionCounter,
+
+      lastQuestion:
+        this.lastQuestion,
+
+      askedQuestions:
+        Array.from(
+          this.askedQuestions
+        ),
+
+      topicsCovered:
+        [...this.topicsCovered],
+
+      inQASection:
+        this.inQASection,
+
+      followUpPending:
+        this.followUpPending,
+
+      pendingCancel:
+        this.pendingCancel,
+
+      offTopicAttempts:
+        this.offTopicAttempts,
+
+      shortAnswerStreak:
+        this.shortAnswerStreak,
+
+      qaOffered:
+        this.qaOffered,
+
+      scores:
+        [...this.scores],
+
+      conversationHistory:
+        [...this.conversationHistory],
+
+      usedOpeners:
+        [...this.usedOpeners],
+
+      usedWords:
+        { ...this.usedWords },
+
+      ackStreak:
+        this.ackStreak,
+
+      turnCount:
+        this.turnCount,
+
+      startTime:
+        this.startTime,
+
+      lastInteraction:
+        this.lastInteraction,
+
+      timeoutWarningSent:
+        this.timeoutWarningSent,
+
+      timeoutWarningTime:
+        this.timeoutWarningTime,
+
+      interviewId:
+        this.interviewId,
+
+      holdTransactionId:
+        this.holdTransactionId,
+
+      recruiterId:
+        this.recruiterId,
+
+      languageLevel:
+        this.languageLevel,
+    };
+  }
+
+  // ==========================================================
+  // HELPERS INTERNOS
+  // ==========================================================
+
+  _cleanString(value) {
+    return String(value ?? '')
+      .trim();
+  }
+
+  _cleanNullable(value) {
+    const normalized =
+      this._cleanString(value);
+
+    return normalized
+      ? normalized
+      : null;
   }
 }
 

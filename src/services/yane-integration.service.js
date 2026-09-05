@@ -2,89 +2,192 @@
 
 const BaseService = require('./base.service');
 
-class YaneIntegrationService extends BaseService {
-  /**
-   * Serviço de integração com a API Yane.
-   *
-   * Responsabilidades:
-   * - Enviar resultados das entrevistas.
-   * - Comunicar com o serviço de IA.
-   * - Enviar status de mensagens.
-   * - Verificar disponibilidade da API Yane.
-   */
+// ============================================================
+// CONFIGURAÇÃO
+// ============================================================
 
+const DEFAULT_API_URL = 'http://localhost:8000/api';
+const DEFAULT_TIMEOUT_MS = 15000;
+
+const ENDPOINTS = Object.freeze({
+  interviewResult: '/interviews/webhooks/result',
+  ai: '/ai/chat',
+  messageStatus: '/webhooks/message-status',
+  health: '/health',
+});
+
+const STATUS_TIMEOUT_MS = 5000;
+const HEALTH_TIMEOUT_MS = 3000;
+
+const FALLBACK_CANDIDATE_EMAIL =
+  'nao_informado@exemplo.com';
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function clean(value) {
+  return String(value ?? '').trim();
+}
+
+function normalizeUrl(url) {
+  return clean(url).replace(/\/+$/, '');
+}
+
+function toPositiveNumber(value, fallback) {
+  const number = Number(value);
+
+  return Number.isFinite(number) && number > 0
+    ? number
+    : fallback;
+}
+
+// ============================================================
+// SERVIÇO
+// ============================================================
+
+class YaneIntegrationService extends BaseService {
   constructor() {
     super();
 
-    // Garante o prefixo /api na URL base caso não informado no .env
-    this.yaneApiUrl = (
-      process.env.YANE_API_URL ||
-      'http://localhost:8000/api'
-    ).replace(/\/+$/, '');
+    this.yaneApiUrl = normalizeUrl(
+      process.env.YANE_API_URL || DEFAULT_API_URL
+    );
 
-    this.webhookEndpoint = '/interviews/webhooks/result';
-    this.aiEndpoint = '/ai/chat'; // Aponta para /api/ai/chat
-    this.statusEndpoint = '/webhooks/message-status';
-    this.timeoutMs = Number(process.env.YANE_API_TIMEOUT) || 15000;
+    this.timeoutMs = toPositiveNumber(
+      process.env.YANE_API_TIMEOUT,
+      DEFAULT_TIMEOUT_MS
+    );
 
-    console.log('[YANE DEBUG] Serviço inicializado.');
-    console.log('[YANE DEBUG] Base URL configurada:', this.yaneApiUrl);
+    this.serviceToken =
+      clean(process.env.YANE_SERVICE_TOKEN) ||
+      clean(process.env.YANE_API_KEY) ||
+      null;
+
+    this.warnIfConfigurationIsIncomplete();
+
+    console.log('[YANE] Serviço inicializado.');
+    console.log(
+      '[YANE] Base URL:',
+      this.yaneApiUrl
+    );
   }
 
-  // ==========================================================================
-  // CONFIGURAÇÃO / HELPERS INTERNOS
-  // ==========================================================================
+  // ==========================================================
+  // CONFIGURAÇÃO
+  // ==========================================================
 
-  /**
-   * Constrói uma URL da API Yane garantindo a formatação correta das barras.
-   */
+  warnIfConfigurationIsIncomplete() {
+    if (!this.serviceToken) {
+      console.warn(
+        '[YANE] Nenhum token configurado. ' +
+        'Defina YANE_SERVICE_TOKEN ou YANE_API_KEY.'
+      );
+    }
+  }
+
+  // ==========================================================
+  // HTTP
+  // ==========================================================
+
   buildUrl(endpoint) {
-    const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
-    const fullUrl = `${this.yaneApiUrl}${cleanEndpoint}`;
-    return fullUrl;
+    const path = `/${clean(endpoint).replace(/^\/+/, '')}`;
+
+    return `${this.yaneApiUrl}${path}`;
   }
 
-  /**
-   * Retorna os headers padrão da integração.
-   * Envia autenticação Bearer por padrão, aceitando YANE_SERVICE_TOKEN ou YANE_API_KEY.
-   */
   getHeaders(includeAuth = true) {
     const headers = {
       'Content-Type': 'application/json',
+      Accept: 'application/json',
     };
 
-    const token = process.env.YANE_SERVICE_TOKEN || process.env.YANE_API_KEY;
-
-    if (includeAuth && token) {
-      headers.Authorization = `Bearer ${token}`;
-    } else if (includeAuth && !token) {
-      console.warn('[YANE DEBUG] AVISO: Nenhum token de autenticação (YANE_SERVICE_TOKEN ou YANE_API_KEY) foi encontrado no .env');
+    if (includeAuth && this.serviceToken) {
+      headers.Authorization =
+        `Bearer ${this.serviceToken}`;
     }
 
     return headers;
   }
 
-  /**
-   * Converte uma resposta HTTP de erro em Error consistente,
-   * extraindo os detalhes retornados pela exceção do FastAPI (campo `detail`).
-   */
-  async createHttpError(response) {
-    let errorDetail = '';
+  async request(
+    endpoint,
+    {
+      method = 'GET',
+      body = undefined,
+      includeAuth = true,
+      timeoutMs = this.timeoutMs,
+      logLabel = 'YANE',
+    } = {}
+  ) {
+    const url = this.buildUrl(endpoint);
+
+    const options = {
+      method,
+      headers: this.getHeaders(includeAuth),
+      signal: AbortSignal.timeout(timeoutMs),
+    };
+
+    if (body !== undefined) {
+      options.body = JSON.stringify(body);
+    }
 
     try {
-      const data = await response.json();
-      errorDetail = data.detail || data.message || JSON.stringify(data);
-    } catch {
-      try {
-        errorDetail = await response.text();
-      } catch {
-        // Mantém o fallback caso o corpo não possa ser lido.
+      const response = await fetch(url, options);
+
+      if (!response.ok) {
+        throw await this.createHttpError(response);
       }
+
+      return response;
+    } catch (error) {
+      console.error(
+        `[${logLabel}] HTTP request failed:`,
+        error.message
+      );
+
+      throw error;
+    }
+  }
+
+  async requestJson(endpoint, options = {}) {
+    const response = await this.request(
+      endpoint,
+      options
+    );
+
+    return this.parseJson(response);
+  }
+
+  async createHttpError(response) {
+    let detail = '';
+
+    try {
+      const contentType =
+        response.headers?.get?.('content-type') || '';
+
+      if (
+        contentType.toLowerCase().includes(
+          'application/json'
+        )
+      ) {
+        const data = await response.json();
+
+        detail =
+          data?.detail ||
+          data?.message ||
+          data?.error ||
+          JSON.stringify(data);
+      } else {
+        detail = await response.text();
+      }
+    } catch (_) {
+      // Algumas respostas HTTP podem não possuir corpo legível.
     }
 
     const message =
-      errorDetail ||
-      response.statusText ||
+      clean(detail) ||
+      clean(response.statusText) ||
       'Erro desconhecido na API Yane';
 
     return new Error(
@@ -92,82 +195,228 @@ class YaneIntegrationService extends BaseService {
     );
   }
 
-  /**
-   * Valida uma resposta HTTP.
-   */
-  async ensureSuccessfulResponse(response) {
-    if (!response.ok) {
-      throw await this.createHttpError(response);
+  async parseJson(response) {
+    const contentType =
+      response.headers?.get?.('content-type') || '';
+
+    if (
+      !contentType.toLowerCase().includes(
+        'application/json'
+      )
+    ) {
+      const text = await response.text();
+
+      if (!clean(text)) {
+        return {};
+      }
+
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        return {
+          response: text,
+        };
+      }
     }
 
-    return response;
-  }
-
-  /**
-   * Faz parsing seguro de JSON.
-   */
-  async parseJson(response) {
     return response.json();
   }
 
-  // ==========================================================================
+  handleIntegrationError(error, context) {
+    console.error(
+      `[YANE] ${context}:`,
+      error.message
+    );
+
+    return this.handleError(
+      error,
+      context
+    );
+  }
+
+  // ==========================================================
   // RESULTADO DA ENTREVISTA
-  // ==========================================================================
+  // ==========================================================
 
-  async sendInterviewResult(data) {
+  buildInterviewResultPayload(data = {}) {
+    return {
+      phone: data.phone,
+
+      candidate_name:
+        data.candidateName,
+
+      expected_candidate_name:
+        data.expectedCandidateName || null,
+
+      is_identity_verified:
+        Boolean(data.isIdentityVerified),
+
+      candidate_email:
+        clean(data.candidateEmail) ||
+        FALLBACK_CANDIDATE_EMAIL,
+
+      candidate_cv:
+        data.candidateCv || null,
+
+      job_title:
+        data.jobTitle,
+
+      job_requirements:
+        Array.isArray(data.jobRequirements)
+          ? data.jobRequirements
+          : [],
+
+      score:
+        data.score,
+
+      feedback:
+        data.feedback,
+
+      recommendation:
+        data.recommendation,
+
+      verified_claims:
+        Array.isArray(data.verifiedClaims)
+          ? data.verifiedClaims
+          : [],
+
+      identified_gaps:
+        Array.isArray(data.identifiedGaps)
+          ? data.identifiedGaps
+          : [],
+
+      transcript:
+        Array.isArray(data.transcript)
+          ? data.transcript
+          : [],
+
+      scores_breakdown:
+        Array.isArray(data.scoresBreakdown)
+          ? data.scoresBreakdown
+          : [],
+
+      interview_id:
+        data.interviewId || null,
+
+      hold_transaction_id:
+        data.holdTransactionId || null,
+
+      actual_cost:
+        data.actualCost ??
+        data.actual_cost ??
+        null,
+    };
+  }
+
+  async sendInterviewResult(data = {}) {
     try {
-      const url = this.buildUrl(this.webhookEndpoint);
+      const payload =
+        this.buildInterviewResultPayload(data);
 
-      console.log('[YANE DEBUG] Enviando resultado de entrevista para:', url);
+      console.log(
+        '[YANE] A enviar resultado da entrevista:',
+        this.buildSafeDebugPayload(payload)
+      );
 
-      const payload = {
-        phone: data.phone,
-        candidate_name: data.candidateName,
-        candidate_email:
-          data.candidateEmail || 'nao_informado@exemplo.com',
-        job_title: data.jobTitle,
-        score: data.score,
-        feedback: data.feedback,
-        recommendation: data.recommendation,
-        transcript: data.transcript,
-        scores_breakdown: data.scoresBreakdown,
-        interview_id: data.interviewId || null,
-        hold_transaction_id: data.holdTransactionId || null,
-        actual_cost: data.actualCost ?? data.actual_cost ?? null,
-      };
+      const result =
+        await this.requestJson(
+          ENDPOINTS.interviewResult,
+          {
+            method: 'POST',
+            body: payload,
+            logLabel: 'YANE INTERVIEW',
+          }
+        );
 
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: this.getHeaders(true),
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-
-      console.log(`[YANE DEBUG] Resposta de Resultado de Entrevista - Status: ${response.status}`);
-
-      await this.ensureSuccessfulResponse(response);
-
-      const result = await this.parseJson(response);
-
-      console.log('[YANE] Resultados da entrevista enviados com sucesso');
+      console.log(
+        '[YANE] Resultado da entrevista enviado com sucesso.'
+      );
 
       return result;
     } catch (error) {
-      console.error(
-        '[YANE] Erro ao enviar resultados:',
-        error.message
-      );
-
-      throw this.handleError(
+      throw this.handleIntegrationError(
         error,
         'Yane Integration'
       );
     }
   }
 
-  // ==========================================================================
+  // ==========================================================
   // IA
-  // ==========================================================================
+  // ==========================================================
+
+  buildAIPayload({
+    messages,
+    model,
+    temperature,
+    userId,
+  }) {
+    const payload = {
+      messages,
+      model,
+      temperature,
+      max_tokens: 1024,
+    };
+
+    if (
+      userId !== null &&
+      userId !== undefined &&
+      clean(userId)
+    ) {
+      payload.user_id = userId;
+    }
+
+    return payload;
+  }
+
+  /**
+   * Extrai conteúdo de diferentes formatos possíveis
+   * devolvidos por APIs de LLM.
+   *
+   * Formatos suportados:
+   *
+   * { response: "..." }
+   * { content: "..." }
+   * { message: { content: "..." } }
+   * { data: { response: "..." } }
+   * { data: { content: "..." } }
+   * { choices: [{ message: { content: "..." } }] }
+   * { choices: [{ text: "..." }] }
+   * "resposta directa"
+   */
+  extractAIContent(result) {
+    if (typeof result === 'string') {
+      return clean(result);
+    }
+
+    if (
+      !result ||
+      typeof result !== 'object'
+    ) {
+      return '';
+    }
+
+    const candidates = [
+      result.response,
+      result.content,
+      result.message?.content,
+      result.data?.response,
+      result.data?.content,
+      result.choices?.[0]?.message?.content,
+      result.choices?.[0]?.text,
+    ];
+
+    for (const value of candidates) {
+      if (
+        typeof value === 'string' &&
+        clean(value)
+      ) {
+        return clean(value);
+      }
+    }
+
+    return '';
+  }
 
   async callAI(
     messages,
@@ -176,91 +425,120 @@ class YaneIntegrationService extends BaseService {
     userId = null
   ) {
     try {
-      const url = this.buildUrl(this.aiEndpoint);
+      const safeMessages =
+        Array.isArray(messages)
+          ? messages
+          : [];
 
-      console.log('--------------------------------------------------');
-      console.log('[YANE DEBUG] Chamando Endpoint da IA...');
-      console.log('[YANE DEBUG] URL Final da Requisição:', url);
-      console.log('[YANE DEBUG] Modelo:', model);
-      console.log('[YANE DEBUG] User ID:', userId || 'Não informado');
-      console.log('[YANE DEBUG] Total de Mensagens:', Array.isArray(messages) ? messages.length : 0);
+      const safeTemperature = Number(
+        temperature
+      );
 
-      const payload = {
-        messages,
-        model,
-        temperature,
-        max_tokens: 1024,
-      };
+      const payload =
+        this.buildAIPayload({
+          messages: safeMessages,
+          model:
+            clean(model) ||
+            'deepseek-chat',
+          temperature:
+            Number.isFinite(
+              safeTemperature
+            )
+              ? safeTemperature
+              : 0.7,
+          userId,
+        });
 
-      if (userId) {
-        payload.user_id = userId;
+      console.log(
+        '[YANE AI] Request:',
+        {
+          model: payload.model,
+
+          userId:
+            userId || 'Não informado',
+
+          messages:
+            safeMessages.length,
+
+          temperature:
+            payload.temperature,
+        }
+      );
+
+      const result =
+        await this.requestJson(
+          ENDPOINTS.ai,
+          {
+            method: 'POST',
+            body: payload,
+            logLabel: 'YANE AI',
+          }
+        );
+
+      const content =
+        this.extractAIContent(result);
+
+      if (!content) {
+        console.warn(
+          '[YANE AI] API respondeu sem conteúdo utilizável.',
+          {
+            responseType:
+              typeof result,
+
+            responseKeys:
+              result &&
+              typeof result === 'object'
+                ? Object.keys(result)
+                : [],
+          }
+        );
       }
 
-      const headers = this.getHeaders(true);
-      console.log('[YANE DEBUG] Headers enviados:', {
-        'Content-Type': headers['Content-Type'],
-        'Authorization': headers.Authorization ? 'Bearer [PRESENTE]' : '[AUSENTE]',
-      });
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-
-      console.log(`[YANE DEBUG] Resposta HTTP da IA Received. Status: ${response.status} (${response.statusText})`);
-      console.log('--------------------------------------------------');
-
-      await this.ensureSuccessfulResponse(response);
-
-      const result = await this.parseJson(response);
-
-      return (
-        result.response ||
-        result.content ||
-        ''
-      );
+      return content;
     } catch (error) {
-      console.error('--------------------------------------------------');
-      console.error('[YANE DEBUG ERROR] Falha na chamada de IA');
-      console.error('[YANE DEBUG ERROR] Mensagem de Erro:', error.message);
-      console.error('--------------------------------------------------');
-
-      throw this.handleError(
+      throw this.handleIntegrationError(
         error,
         'Yane AI'
       );
     }
   }
 
-  // ==========================================================================
+  // ==========================================================
   // STATUS DE MENSAGEM
-  // ==========================================================================
+  // ==========================================================
 
-  async sendMessageStatus(data) {
+  buildMessageStatusPayload(data = {}) {
+    return {
+      phone: data.phone,
+
+      message_id:
+        data.message_id,
+
+      status:
+        data.status || 'read',
+
+      timestamp:
+        data.timestamp ||
+        new Date().toISOString(),
+    };
+  }
+
+  async sendMessageStatus(data = {}) {
     try {
-      const url = this.buildUrl(this.statusEndpoint);
+      const payload =
+        this.buildMessageStatusPayload(data);
 
-      console.log('[YANE DEBUG] Enviando status de mensagem para:', url);
-
-      const payload = {
-        phone: data.phone,
-        message_id: data.message_id,
-        status: data.status || 'read',
-        timestamp:
-          data.timestamp ||
-          new Date().toISOString(),
-      };
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: this.getHeaders(true),
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(5000),
-      });
-
-      console.log(`[YANE DEBUG] Resposta de Status de Mensagem - Status: ${response.status}`);
+      const response =
+        await this.request(
+          ENDPOINTS.messageStatus,
+          {
+            method: 'POST',
+            body: payload,
+            timeoutMs:
+              STATUS_TIMEOUT_MS,
+            logLabel: 'YANE STATUS',
+          }
+        );
 
       return response.ok;
     } catch (error) {
@@ -273,28 +551,84 @@ class YaneIntegrationService extends BaseService {
     }
   }
 
-  // ==========================================================================
+  // ==========================================================
   // HEALTH CHECK
-  // ==========================================================================
+  // ==========================================================
 
   async healthCheck() {
     try {
-      const url = this.buildUrl('/health');
-      console.log('[YANE DEBUG] Testando Health Check em:', url);
-
-      const response = await fetch(url, {
-        headers: this.getHeaders(false),
-        signal: AbortSignal.timeout(3000),
-      });
-
-      console.log(`[YANE DEBUG] Health Check Status: ${response.status}`);
+      const response =
+        await this.request(
+          ENDPOINTS.health,
+          {
+            method: 'GET',
+            includeAuth: false,
+            timeoutMs:
+              HEALTH_TIMEOUT_MS,
+            logLabel: 'YANE HEALTH',
+          }
+        );
 
       return response.ok;
     } catch (error) {
-      console.error('[YANE DEBUG] Health Check falhou:', error.message);
+      console.error(
+        '[YANE] Health check falhou:',
+        error.message
+      );
+
       return false;
     }
+  }
+
+  // ==========================================================
+  // DEBUG SEGURO
+  // ==========================================================
+
+  buildSafeDebugPayload(payload = {}) {
+    return {
+      phone:
+        payload.phone || null,
+
+      candidate_name:
+        payload.candidate_name ||
+        null,
+
+      job_title:
+        payload.job_title ||
+        null,
+
+      score:
+        payload.score ?? null,
+
+      recommendation:
+        payload.recommendation ||
+        null,
+
+      interview_id:
+        payload.interview_id ||
+        null,
+
+      has_cv:
+        Boolean(
+          payload.candidate_cv
+        ),
+
+      transcript_size:
+        Array.isArray(
+          payload.transcript
+        )
+          ? payload.transcript.length
+          : 0,
+
+      scores_size:
+        Array.isArray(
+          payload.scores_breakdown
+        )
+          ? payload.scores_breakdown.length
+          : 0,
+    };
   }
 }
 
 module.exports = YaneIntegrationService;
+
