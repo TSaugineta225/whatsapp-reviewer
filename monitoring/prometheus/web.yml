@@ -1,0 +1,11 @@
+# monitoring/prometheus/web.yml
+#
+# Protege a UI do Prometheus (:9090) com basic auth.
+# Gerar hash:
+#   htpasswd -nbB admin 'tua-password'
+#
+# Se não quiseres auth, remove o bloco `basic_auth_users` e o
+# `--web.config.file` do docker-compose.
+
+basic_auth_users:
+  admin: "$2y$12$troque.pelo.hash.gerado.com.htpasswd"

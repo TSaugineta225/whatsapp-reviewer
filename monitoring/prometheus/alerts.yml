@@ -1,0 +1,111 @@
+# monitoring/prometheus/alerts.yml
+
+groups:
+
+  # ==========================================================
+  # DISPONIBILIDADE
+  # ==========================================================
+  - name: availability
+    interval: 30s
+    rules:
+
+      - alert: BotDown
+        expr: up{job="yane-bot"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Bot Node está down"
+          description: "O bot não responde ao /metrics há 2 minutos."
+
+      - alert: WhatsAppDisconnected
+        expr: yane_whatsapp_connected == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WhatsApp desconectado"
+          description: "A ligação Baileys está inactiva há 5 minutos."
+
+      - alert: RedisDown
+        expr: yane_redis_connected == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis inacessível"
+          description: "O bot perdeu ligação ao Redis há 1 minuto."
+
+      - alert: BackendUnreachable
+        expr: rate(yane_turns_total{status="backend_error"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend Python com erros"
+          description: "Taxa de erros > 0.1/s durante 5 minutos."
+
+  # ==========================================================
+  # PERFORMANCE
+  # ==========================================================
+  - name: performance
+    interval: 30s
+    rules:
+
+      - alert: HighTurnLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(yane_turn_duration_seconds_bucket[5m])) by (le)
+          ) > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Turnos lentos (p95 > 20s)"
+          description: "p95 do processamento de turnos acima de 20s há 5 min."
+
+      - alert: HighMessageFailureRate
+        expr: |
+          (
+            rate(yane_messages_sent_total{status="failed"}[5m])
+            /
+            rate(yane_messages_sent_total[5m])
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Taxa de falha de envio > 5%"
+          description: "Mais de 5% das mensagens WhatsApp estão a falhar."
+
+  # ==========================================================
+  # ACTIVIDADE
+  # ==========================================================
+  - name: activity
+    interval: 1m
+    rules:
+
+      - alert: NoTurnsProcessed
+        # Só dispara se o bot está ligado, tem Redis, mas não processa turnos.
+        expr: |
+          (
+            rate(yane_turns_total[30m]) == 0
+            and yane_whatsapp_connected == 1
+            and yane_redis_connected == 1
+          )
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "Sem turnos processados há 30 min"
+          description: "Bot ligado mas sem tráfego. Pode ser normal ou problema de roteamento."
+
+      - alert: HighErrorRate
+        expr: rate(yane_errors_total[10m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Taxa de erros elevada"
+          description: "Mais de 1 erro/s durante 10 minutos."

@@ -1,0 +1,71 @@
+# monitoring/prometheus/prometheus.yml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: yane-prod
+    env: production
+
+# Alertmanager
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+# Regras de alerta
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# Scrape configs
+scrape_configs:
+
+  # ----------------------------------------------------------
+  # Bot Node
+  # ----------------------------------------------------------
+  - job_name: 'yane-bot'
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ['bot:3000']
+    # Se METRICS_TOKEN estiver definido no bot, descomenta:
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/bot-token
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'yane-bot'
+
+  # ----------------------------------------------------------
+  # Backend Python (FastAPI) — adiciona se instrumentares lá
+  # Requer `prometheus-fastapi-instrumentator` no backend.
+  # ----------------------------------------------------------
+  - job_name: 'yane-backend'
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ['host.docker.internal:8000']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'yane-backend'
+    # Se o backend estiver noutro host, muda o target.
+
+  # ----------------------------------------------------------
+  # Redis exporter
+  # ----------------------------------------------------------
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'yane-redis'
+
+  # ----------------------------------------------------------
+  # Auto-monitorização do Prometheus
+  # ----------------------------------------------------------
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

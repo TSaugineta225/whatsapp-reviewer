@@ -1,0 +1,93 @@
+# Caddyfile
+#
+# Reverse proxy com HTTPS automático (Let's Encrypt).
+#
+# Pré-requisitos:
+#   1. Domínio apontado para este servidor (A record)
+#   2. Portas 80 e 443 abertas
+#   3. Caddy corre no serviço `caddy` do docker-compose
+#
+# Ajusta os domínios abaixo para os teus.
+
+{
+    email admin@yane.co.mz
+
+    # Logs
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 20MB
+            roll_keep 10
+        }
+        format json
+    }
+}
+
+# ============================================================
+# BOT (API interna exposta ao backend Python)
+# ============================================================
+bot.yane.co.mz {
+    reverse_proxy bot:3000
+
+    # Segurança
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
+    # Limitar métodos
+    @blocked not method POST GET
+    respond @blocked 405
+
+    # Bloquear /reset em produção
+    @reset path /reset
+    respond @reset 403
+
+    # Timeouts
+    timeouts {
+        read_body 30s
+        read_header 10s
+        write 60s
+        idle 120s
+    }
+}
+
+# ============================================================
+# GRAFANA (dashboard de monitoring)
+# ============================================================
+grafana.yane.co.mz {
+    reverse_proxy grafana:3000
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        -Server
+    }
+
+    encode gzip
+
+    # Grafana usa WebSockets — desactivar buffering
+    reverse_proxy {
+        flush_interval -1
+    }
+}
+
+# ============================================================
+# PROMETHEUS (opcional — só se quiseres aceder de fora)
+# ============================================================
+# prometheus.yane.co.mz {
+#     reverse_proxy prometheus:9090
+#
+#     # Basic auth recomendado
+#     basicauth {
+#         admin $2y$12$hash.gerado.com.htpasswd
+#     }
+#
+#     header {
+#         Strict-Transport-Security "max-age=31536000; includeSubDomains"
+#         -Server
+#     }
+# }

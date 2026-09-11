@@ -1,26 +1,29 @@
 // src/services/yane-integration.service.js
+//
+// Cliente HTTP minimalista para o backend Python.
+// Só expõe os endpoints que o bot usa.
 
 const BaseService = require('./base.service');
 
 // ============================================================
-// CONFIGURAÇÃO
+// CONFIG
 // ============================================================
 
 const DEFAULT_API_URL = 'http://localhost:8000/api';
 const DEFAULT_TIMEOUT_MS = 15000;
 
-const ENDPOINTS = Object.freeze({
-  interviewResult: '/interviews/webhooks/result',
-  ai: '/ai/chat',
-  messageStatus: '/webhooks/message-status',
-  health: '/health',
-});
-
+const TURN_TIMEOUT_MS = 45000;
 const STATUS_TIMEOUT_MS = 5000;
 const HEALTH_TIMEOUT_MS = 3000;
 
-const FALLBACK_CANDIDATE_EMAIL =
-  'nao_informado@exemplo.com';
+const ENDPOINTS = Object.freeze({
+  interviewTurn: (interviewId) =>
+    `/interviews/${interviewId}/turn`,
+  interviewByPhone: (phone) =>
+    `/interviews/by-phone/${encodeURIComponent(phone)}`,
+  messageStatus: '/webhooks/message-status',
+  health: '/health',
+});
 
 // ============================================================
 // HELPERS
@@ -36,10 +39,7 @@ function normalizeUrl(url) {
 
 function toPositiveNumber(value, fallback) {
   const number = Number(value);
-
-  return Number.isFinite(number) && number > 0
-    ? number
-    : fallback;
+  return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
 // ============================================================
@@ -64,35 +64,23 @@ class YaneIntegrationService extends BaseService {
       clean(process.env.YANE_API_KEY) ||
       null;
 
-    this.warnIfConfigurationIsIncomplete();
-
-    console.log('[YANE] Serviço inicializado.');
-    console.log(
-      '[YANE] Base URL:',
-      this.yaneApiUrl
-    );
-  }
-
-  // ==========================================================
-  // CONFIGURAÇÃO
-  // ==========================================================
-
-  warnIfConfigurationIsIncomplete() {
     if (!this.serviceToken) {
       console.warn(
         '[YANE] Nenhum token configurado. ' +
-        'Defina YANE_SERVICE_TOKEN ou YANE_API_KEY.'
+          'Defina YANE_SERVICE_TOKEN ou YANE_API_KEY.'
       );
     }
+
+    console.log('[YANE] Serviço inicializado.');
+    console.log('[YANE] Base URL:', this.yaneApiUrl);
   }
 
   // ==========================================================
-  // HTTP
+  // HTTP BASE
   // ==========================================================
 
   buildUrl(endpoint) {
     const path = `/${clean(endpoint).replace(/^\/+/, '')}`;
-
     return `${this.yaneApiUrl}${path}`;
   }
 
@@ -103,8 +91,7 @@ class YaneIntegrationService extends BaseService {
     };
 
     if (includeAuth && this.serviceToken) {
-      headers.Authorization =
-        `Bearer ${this.serviceToken}`;
+      headers.Authorization = `Bearer ${this.serviceToken}`;
     }
 
     return headers;
@@ -141,21 +128,13 @@ class YaneIntegrationService extends BaseService {
 
       return response;
     } catch (error) {
-      console.error(
-        `[${logLabel}] HTTP request failed:`,
-        error.message
-      );
-
+      console.error(`[${logLabel}] HTTP request failed:`, error.message);
       throw error;
     }
   }
 
   async requestJson(endpoint, options = {}) {
-    const response = await this.request(
-      endpoint,
-      options
-    );
-
+    const response = await this.request(endpoint, options);
     return this.parseJson(response);
   }
 
@@ -166,13 +145,8 @@ class YaneIntegrationService extends BaseService {
       const contentType =
         response.headers?.get?.('content-type') || '';
 
-      if (
-        contentType.toLowerCase().includes(
-          'application/json'
-        )
-      ) {
+      if (contentType.toLowerCase().includes('application/json')) {
         const data = await response.json();
-
         detail =
           data?.detail ||
           data?.message ||
@@ -182,7 +156,7 @@ class YaneIntegrationService extends BaseService {
         detail = await response.text();
       }
     } catch (_) {
-      // Algumas respostas HTTP podem não possuir corpo legível.
+      // Sem corpo legível — ignorar.
     }
 
     const message =
@@ -190,32 +164,21 @@ class YaneIntegrationService extends BaseService {
       clean(response.statusText) ||
       'Erro desconhecido na API Yane';
 
-    return new Error(
-      `HTTP ${response.status}: ${message}`
-    );
+    return new Error(`HTTP ${response.status}: ${message}`);
   }
 
   async parseJson(response) {
     const contentType =
       response.headers?.get?.('content-type') || '';
 
-    if (
-      !contentType.toLowerCase().includes(
-        'application/json'
-      )
-    ) {
+    if (!contentType.toLowerCase().includes('application/json')) {
       const text = await response.text();
-
-      if (!clean(text)) {
-        return {};
-      }
+      if (!clean(text)) return {};
 
       try {
         return JSON.parse(text);
       } catch (_) {
-        return {
-          response: text,
-        };
+        return { response: text };
       }
     }
 
@@ -223,282 +186,72 @@ class YaneIntegrationService extends BaseService {
   }
 
   handleIntegrationError(error, context) {
-    console.error(
-      `[YANE] ${context}:`,
-      error.message
-    );
-
-    return this.handleError(
-      error,
-      context
-    );
+    console.error(`[YANE] ${context}:`, error.message);
+    return this.handleError(error, context);
   }
 
   // ==========================================================
-  // RESULTADO DA ENTREVISTA
+  // TURNO DA ENTREVISTA
   // ==========================================================
 
-  buildInterviewResultPayload(data = {}) {
-    return {
-      phone: data.phone,
-
-      candidate_name:
-        data.candidateName,
-
-      expected_candidate_name:
-        data.expectedCandidateName || null,
-
-      is_identity_verified:
-        Boolean(data.isIdentityVerified),
-
-      candidate_email:
-        clean(data.candidateEmail) ||
-        FALLBACK_CANDIDATE_EMAIL,
-
-      candidate_cv:
-        data.candidateCv || null,
-
-      job_title:
-        data.jobTitle,
-
-      job_requirements:
-        Array.isArray(data.jobRequirements)
-          ? data.jobRequirements
-          : [],
-
-      score:
-        data.score,
-
-      feedback:
-        data.feedback,
-
-      recommendation:
-        data.recommendation,
-
-      verified_claims:
-        Array.isArray(data.verifiedClaims)
-          ? data.verifiedClaims
-          : [],
-
-      identified_gaps:
-        Array.isArray(data.identifiedGaps)
-          ? data.identifiedGaps
-          : [],
-
-      transcript:
-        Array.isArray(data.transcript)
-          ? data.transcript
-          : [],
-
-      scores_breakdown:
-        Array.isArray(data.scoresBreakdown)
-          ? data.scoresBreakdown
-          : [],
-
-      interview_id:
-        data.interviewId || null,
-
-      hold_transaction_id:
-        data.holdTransactionId || null,
-
-      actual_cost:
-        data.actualCost ??
-        data.actual_cost ??
-        null,
-    };
-  }
-
-  async sendInterviewResult(data = {}) {
-    try {
-      const payload =
-        this.buildInterviewResultPayload(data);
-
-      console.log(
-        '[YANE] A enviar resultado da entrevista:',
-        this.buildSafeDebugPayload(payload)
-      );
-
-      const result =
-        await this.requestJson(
-          ENDPOINTS.interviewResult,
-          {
-            method: 'POST',
-            body: payload,
-            logLabel: 'YANE INTERVIEW',
-          }
-        );
-
-      console.log(
-        '[YANE] Resultado da entrevista enviado com sucesso.'
-      );
-
-      return result;
-    } catch (error) {
-      throw this.handleIntegrationError(
-        error,
-        'Yane Integration'
-      );
+  async sendInterviewTurn({ interviewId, phone, message, turnId }) {
+    if (!interviewId) {
+      throw new Error('interviewId é obrigatório.');
     }
-  }
 
-  // ==========================================================
-  // IA
-  // ==========================================================
+    if (!phone || !message) {
+      throw new Error('phone e message são obrigatórios.');
+    }
 
-  buildAIPayload({
-    messages,
-    model,
-    temperature,
-    userId,
-  }) {
     const payload = {
-      messages,
-      model,
-      temperature,
-      max_tokens: 1024,
+      phone,
+      message,
+      turn_id: turnId || null,
     };
 
-    if (
-      userId !== null &&
-      userId !== undefined &&
-      clean(userId)
-    ) {
-      payload.user_id = userId;
-    }
-
-    return payload;
+    return this.requestJson(ENDPOINTS.interviewTurn(interviewId), {
+      method: 'POST',
+      body: payload,
+      timeoutMs: TURN_TIMEOUT_MS,
+      logLabel: 'YANE TURN',
+    });
   }
+
+  // ==========================================================
+  // LOOKUP POR TELEFONE
+  // ==========================================================
 
   /**
-   * Extrai conteúdo de diferentes formatos possíveis
-   * devolvidos por APIs de LLM.
+   * Procura a entrevista activa associada a um telefone.
    *
-   * Formatos suportados:
+   * Usado pelo bot quando perde o mapeamento local em Redis
+   * (ex.: restart, flush, TTL expirado).
    *
-   * { response: "..." }
-   * { content: "..." }
-   * { message: { content: "..." } }
-   * { data: { response: "..." } }
-   * { data: { content: "..." } }
-   * { choices: [{ message: { content: "..." } }] }
-   * { choices: [{ text: "..." }] }
-   * "resposta directa"
+   * Devolve null se não existir entrevista activa.
    */
-  extractAIContent(result) {
-    if (typeof result === 'string') {
-      return clean(result);
-    }
+  async findActiveInterviewByPhone(phone) {
+    if (!phone) return null;
 
-    if (
-      !result ||
-      typeof result !== 'object'
-    ) {
-      return '';
-    }
-
-    const candidates = [
-      result.response,
-      result.content,
-      result.message?.content,
-      result.data?.response,
-      result.data?.content,
-      result.choices?.[0]?.message?.content,
-      result.choices?.[0]?.text,
-    ];
-
-    for (const value of candidates) {
-      if (
-        typeof value === 'string' &&
-        clean(value)
-      ) {
-        return clean(value);
-      }
-    }
-
-    return '';
-  }
-
-  async callAI(
-    messages,
-    model = 'deepseek-chat',
-    temperature = 0.7,
-    userId = null
-  ) {
     try {
-      const safeMessages =
-        Array.isArray(messages)
-          ? messages
-          : [];
-
-      const safeTemperature = Number(
-        temperature
-      );
-
-      const payload =
-        this.buildAIPayload({
-          messages: safeMessages,
-          model:
-            clean(model) ||
-            'deepseek-chat',
-          temperature:
-            Number.isFinite(
-              safeTemperature
-            )
-              ? safeTemperature
-              : 0.7,
-          userId,
-        });
-
-      console.log(
-        '[YANE AI] Request:',
+      const result = await this.requestJson(
+        ENDPOINTS.interviewByPhone(phone),
         {
-          model: payload.model,
-
-          userId:
-            userId || 'Não informado',
-
-          messages:
-            safeMessages.length,
-
-          temperature:
-            payload.temperature,
+          method: 'GET',
+          timeoutMs: this.timeoutMs,
+          logLabel: 'YANE LOOKUP',
         }
       );
 
-      const result =
-        await this.requestJson(
-          ENDPOINTS.ai,
-          {
-            method: 'POST',
-            body: payload,
-            logLabel: 'YANE AI',
-          }
-        );
-
-      const content =
-        this.extractAIContent(result);
-
-      if (!content) {
-        console.warn(
-          '[YANE AI] API respondeu sem conteúdo utilizável.',
-          {
-            responseType:
-              typeof result,
-
-            responseKeys:
-              result &&
-              typeof result === 'object'
-                ? Object.keys(result)
-                : [],
-          }
-        );
+      return result || null;
+    } catch (error) {
+      // 404 = sem entrevista activa → não é erro
+      if (error.message?.includes('404')) {
+        return null;
       }
 
-      return content;
-    } catch (error) {
       throw this.handleIntegrationError(
         error,
-        'Yane AI'
+        'Yane Interview Lookup'
       );
     }
   }
@@ -507,46 +260,23 @@ class YaneIntegrationService extends BaseService {
   // STATUS DE MENSAGEM
   // ==========================================================
 
-  buildMessageStatusPayload(data = {}) {
-    return {
-      phone: data.phone,
-
-      message_id:
-        data.message_id,
-
-      status:
-        data.status || 'read',
-
-      timestamp:
-        data.timestamp ||
-        new Date().toISOString(),
-    };
-  }
-
-  async sendMessageStatus(data = {}) {
+  async sendMessageStatus({ phone, messageId, status = 'read' }) {
     try {
-      const payload =
-        this.buildMessageStatusPayload(data);
-
-      const response =
-        await this.request(
-          ENDPOINTS.messageStatus,
-          {
-            method: 'POST',
-            body: payload,
-            timeoutMs:
-              STATUS_TIMEOUT_MS,
-            logLabel: 'YANE STATUS',
-          }
-        );
+      const response = await this.request(ENDPOINTS.messageStatus, {
+        method: 'POST',
+        body: {
+          phone,
+          message_id: messageId,
+          status,
+          timestamp: new Date().toISOString(),
+        },
+        timeoutMs: STATUS_TIMEOUT_MS,
+        logLabel: 'YANE STATUS',
+      });
 
       return response.ok;
     } catch (error) {
-      console.error(
-        '[YANE] Erro ao enviar status:',
-        error.message
-      );
-
+      console.error('[YANE] Erro ao enviar status:', error.message);
       return false;
     }
   }
@@ -557,78 +287,19 @@ class YaneIntegrationService extends BaseService {
 
   async healthCheck() {
     try {
-      const response =
-        await this.request(
-          ENDPOINTS.health,
-          {
-            method: 'GET',
-            includeAuth: false,
-            timeoutMs:
-              HEALTH_TIMEOUT_MS,
-            logLabel: 'YANE HEALTH',
-          }
-        );
+      const response = await this.request(ENDPOINTS.health, {
+        method: 'GET',
+        includeAuth: false,
+        timeoutMs: HEALTH_TIMEOUT_MS,
+        logLabel: 'YANE HEALTH',
+      });
 
       return response.ok;
     } catch (error) {
-      console.error(
-        '[YANE] Health check falhou:',
-        error.message
-      );
-
+      console.error('[YANE] Health check falhou:', error.message);
       return false;
     }
-  }
-
-  // ==========================================================
-  // DEBUG SEGURO
-  // ==========================================================
-
-  buildSafeDebugPayload(payload = {}) {
-    return {
-      phone:
-        payload.phone || null,
-
-      candidate_name:
-        payload.candidate_name ||
-        null,
-
-      job_title:
-        payload.job_title ||
-        null,
-
-      score:
-        payload.score ?? null,
-
-      recommendation:
-        payload.recommendation ||
-        null,
-
-      interview_id:
-        payload.interview_id ||
-        null,
-
-      has_cv:
-        Boolean(
-          payload.candidate_cv
-        ),
-
-      transcript_size:
-        Array.isArray(
-          payload.transcript
-        )
-          ? payload.transcript.length
-          : 0,
-
-      scores_size:
-        Array.isArray(
-          payload.scores_breakdown
-        )
-          ? payload.scores_breakdown.length
-          : 0,
-    };
   }
 }
 
 module.exports = YaneIntegrationService;
-

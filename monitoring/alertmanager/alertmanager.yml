@@ -1,0 +1,86 @@
+# monitoring/alertmanager/alertmanager.yml
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # Críticos vão para o receiver "critical" com mais agressividade.
+    - matchers:
+        - severity = "critical"
+      receiver: 'critical'
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # Warnings vão para o receiver "warning".
+    - matchers:
+        - severity = "warning"
+      receiver: 'warning'
+
+    # Info vai para o receiver "info".
+    - matchers:
+        - severity = "info"
+      receiver: 'info'
+
+receivers:
+
+  # ----------------------------------------------------------
+  # DEFAULT — configura aqui um dos seguintes:
+  #   - webhook (Slack, Mattermost, Rocket.chat)
+  #   - email
+  #   - telegram
+  #   - discord
+  # ----------------------------------------------------------
+
+  - name: 'default'
+    webhook_configs:
+      - url: '${ALERTMANAGER_WEBHOOK_URL}'
+        send_resolved: true
+
+  - name: 'critical'
+    webhook_configs:
+      - url: '${ALERTMANAGER_WEBHOOK_URL}'
+        send_resolved: true
+
+  - name: 'warning'
+    webhook_configs:
+      - url: '${ALERTMANAGER_WEBHOOK_URL}'
+        send_resolved: true
+
+  - name: 'info'
+    webhook_configs:
+      - url: '${ALERTMANAGER_WEBHOOK_URL}'
+        send_resolved: true
+
+# ============================================================
+# EXEMPLO — Telegram
+# ============================================================
+#
+# 1. Cria bot no @BotFather, obtém token
+# 2. Descobre o chat_id (manda mensagem ao bot, abre:
+#    https://api.telegram.org/bot<TOKEN>/getUpdates)
+# 3. Substitui os receivers acima por:
+#
+# receivers:
+#   - name: 'critical'
+#     telegram_configs:
+#       - bot_token: '123456:ABC...'
+#         chat_id: -1001234567890
+#         parse_mode: 'HTML'
+#         message: |
+#           🚨 <b>{{ .GroupLabels.alertname }}</b>
+#           {{ range .Alerts }}{{ .Annotations.description }}{{ end }}
+
+inhibit_rules:
+  # Se o bot está down, não spammar com alertas derivados.
+  - source_matchers:
+      - alertname = "BotDown"
+    target_matchers:
+      - severity =~ "warning|info"
+    equal: []

@@ -1,0 +1,365 @@
+# docker-compose.yml
+version: "3.9"
+
+# ============================================================
+# REDES
+# ============================================================
+
+networks:
+  internal:
+    driver: bridge
+    internal: true     # sem acesso à internet — só entre containers
+  public:
+    driver: bridge
+
+# ============================================================
+# VOLUMES
+# ============================================================
+
+volumes:
+  auth_info:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/yane-bot/auth_info
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  alertmanager_data:
+    driver: local
+  grafana_data:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local
+
+# ============================================================
+# SERVIÇOS
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # REDIS
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: yane-redis
+    restart: unless-stopped
+
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
+      - "--maxmemory"
+      - "256mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      - "--save"
+      - "900"
+      - "1"
+      - "--save"
+      - "300"
+      - "10"
+      - "--requirepass"
+      - "${REDIS_PASSWORD:?REDIS_PASSWORD é obrigatório}"
+      - "--protected-mode"
+      - "yes"
+
+    environment:
+      TZ: Africa/Maputo
+
+    volumes:
+      - redis_data:/data
+
+    networks:
+      - internal
+
+    healthcheck:
+      test:
+        - "CMD"
+        - "redis-cli"
+        - "-a"
+        - "${REDIS_PASSWORD}"
+        - "--no-auth-warning"
+        - "ping"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 384M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    security_opt:
+      - no-new-privileges:true
+
+  # ----------------------------------------------------------
+  # BOT
+  # ----------------------------------------------------------
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yane-bot:latest
+    container_name: yane-bot
+    restart: unless-stopped
+
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      TZ: Africa/Maputo
+
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      REDIS_PREFIX: "yane"
+
+      YANE_API_URL: "${YANE_API_URL:?YANE_API_URL é obrigatório}"
+      YANE_SERVICE_TOKEN: "${YANE_SERVICE_TOKEN:?YANE_SERVICE_TOKEN é obrigatório}"
+      YANE_API_TIMEOUT: "15000"
+
+      DEFAULT_COUNTRY_CODE: "258"
+      WHATSAPP_TYPING_MS_PER_CHAR: "22"
+      WHATSAPP_TYPING_MAX_MS: "2600"
+
+      METRICS_TOKEN: "${METRICS_TOKEN:-}"
+
+      NODE_OPTIONS: "--max-old-space-size=768"
+
+    volumes:
+      - auth_info:/app/auth_info
+      - ./logs/bot:/app/logs
+
+    ports:
+      - "${BOT_BIND_HOST:-127.0.0.1}:${BOT_BIND_PORT:-3000}:3000"
+
+    networks:
+      - internal
+      - public
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  # ----------------------------------------------------------
+  # CADDY (reverse proxy opcional)
+  # ----------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    container_name: yane-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - ./logs/caddy:/var/log/caddy
+    networks:
+      - public
+    depends_on:
+      bot:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+
+  # ----------------------------------------------------------
+  # REDIS EXPORTER
+  # ----------------------------------------------------------
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0-alpine
+    container_name: yane-redis-exporter
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      REDIS_EXPORTER_LOG_FORMAT: "json"
+    networks:
+      - internal
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+
+  # ----------------------------------------------------------
+  # PROMETHEUS
+  # ----------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: yane-prometheus
+    restart: unless-stopped
+    user: "65534:65534"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--storage.tsdb.retention.size=5GB"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks:
+      - internal
+    depends_on:
+      - alertmanager
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+
+  # ----------------------------------------------------------
+  # ALERTMANAGER
+  # ----------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: yane-alertmanager
+    restart: unless-stopped
+    user: "65534:65534"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--web.external-url=http://localhost:9093"
+    environment:
+      ALERTMANAGER_WEBHOOK_URL: "${ALERTMANAGER_WEBHOOK_URL:-}"
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+
+  # ----------------------------------------------------------
+  # GRAFANA
+  # ----------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: yane-grafana
+    restart: unless-stopped
+    user: "472:472"
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD é obrigatório}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "${GRAFANA_ROOT_URL:-http://localhost:3001}"
+      GF_SERVER_DOMAIN: "${GRAFANA_DOMAIN:-localhost}"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      TZ: Africa/Maputo
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
+    networks:
+      - internal
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
