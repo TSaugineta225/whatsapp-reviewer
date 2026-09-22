@@ -3,15 +3,6 @@
 // Registry central de métricas Prometheus do bot.
 //
 // Exposto via GET /metrics pelo app.js.
-//
-// Métricas instrumentadas:
-//   - Entrevistas iniciadas/terminadas/concluídas
-//   - Turnos processados (por status)
-//   - Latência do backend Python (histograma)
-//   - Mensagens WhatsApp enviadas/recebidas
-//   - Erros por subsistema
-//   - Estado da conexão (WhatsApp, Redis)
-//   - Contagem de entrevistas activas (actualizada a cada 30s)
 
 const client = require('prom-client');
 
@@ -19,10 +10,8 @@ class MetricsService {
   constructor() {
     this.registry = new client.Registry();
 
-    // Prefixo comum a todas as métricas.
     this.registry.setDefaultLabels({ app: 'yane-bot' });
 
-    // Métricas padrão do Node (CPU, memória, event loop, GC).
     client.collectDefaultMetrics({
       register: this.registry,
       prefix: 'yane_node_',
@@ -30,7 +19,6 @@ class MetricsService {
 
     this._defineMetrics();
 
-    // Refresh periódico de métricas que exigem I/O (Redis).
     this._refreshTimer = null;
   }
 
@@ -46,14 +34,21 @@ class MetricsService {
     // ----------------------------------------------------------
     this.interviewsStarted = new client.Counter({
       name: 'yane_interviews_started_total',
-      help: 'Total de entrevistas iniciadas',
+      help: 'Total de entrevistas iniciadas (convite entregue)',
+      registers: [r],
+    });
+
+    this.interviewsQueued = new client.Counter({
+      name: 'yane_interviews_queued_total',
+      help:
+        'Entrevistas cujo convite ficou em fila para entrega',
       registers: [r],
     });
 
     this.interviewsFinished = new client.Counter({
       name: 'yane_interviews_finished_total',
       help: 'Total de entrevistas terminadas',
-      labelNames: ['status'], // completed | cancelled | expired
+      labelNames: ['status'],
       registers: [r],
     });
 
@@ -69,7 +64,7 @@ class MetricsService {
     this.turnsTotal = new client.Counter({
       name: 'yane_turns_total',
       help: 'Total de turnos processados',
-      labelNames: ['status'], // success | backend_error | duplicate | locked | no_interview
+      labelNames: ['status'],
       registers: [r],
     });
 
@@ -87,14 +82,14 @@ class MetricsService {
     this.messagesReceived = new client.Counter({
       name: 'yane_messages_received_total',
       help: 'Total de mensagens recebidas do WhatsApp',
-      labelNames: ['type'], // text | button | other
+      labelNames: ['type'],
       registers: [r],
     });
 
     this.messagesSent = new client.Counter({
       name: 'yane_messages_sent_total',
       help: 'Total de mensagens enviadas para o WhatsApp',
-      labelNames: ['status'], // success | failed | rate_limited
+      labelNames: ['status'],
       registers: [r],
     });
 
@@ -106,12 +101,12 @@ class MetricsService {
     });
 
     // ----------------------------------------------------------
-    // Erros por subsistema
+    // Erros
     // ----------------------------------------------------------
     this.errorsTotal = new client.Counter({
       name: 'yane_errors_total',
       help: 'Total de erros por subsistema',
-      labelNames: ['subsystem'], // backend | redis | whatsapp | ai
+      labelNames: ['subsystem'],
       registers: [r],
     });
 
@@ -142,7 +137,7 @@ class MetricsService {
     this.rateLimitHits = new client.Counter({
       name: 'yane_rate_limit_hits_total',
       help: 'Total de vezes que o rate limit foi atingido',
-      labelNames: ['bucket'], // out
+      labelNames: ['bucket'],
       registers: [r],
     });
   }
@@ -151,26 +146,17 @@ class MetricsService {
   // INICIALIZAÇÃO / SHUTDOWN
   // ============================================================
 
-  /**
-   * Inicia o refresh periódico de métricas que dependem de I/O.
-   *
-   * @param {Object} deps — { redis, whatsappService }
-   */
   start(deps = {}) {
     this.redis = deps.redis || null;
     this.whatsappService = deps.whatsappService || null;
 
-    // Actualização inicial
     this._refreshDerivedMetrics();
 
-    // Refresh a cada 30s (mais rápido que o scrape do Prometheus — 15s — mas
-    // suficientemente espaçado para não sobrecarregar o Redis).
     this._refreshTimer = setInterval(
       () => this._refreshDerivedMetrics(),
       30_000
     );
 
-    // Não bloquear o shutdown do Node
     if (this._refreshTimer.unref) this._refreshTimer.unref();
   }
 
@@ -182,7 +168,6 @@ class MetricsService {
   }
 
   async _refreshDerivedMetrics() {
-    // Redis
     if (this.redis) {
       this.redisConnected.set(this.redis.isReady ? 1 : 0);
 
@@ -198,7 +183,6 @@ class MetricsService {
       }
     }
 
-    // WhatsApp
     if (this.whatsappService) {
       const connected = this.whatsappService.isReady ? 1 : 0;
       this.whatsappConnected.set(connected);
@@ -215,8 +199,6 @@ class MetricsService {
   }
 
   async _countInterviewKeys() {
-    // Usa SCAN por padrão — não bloqueia o Redis.
-    // É aceitável a cada 30s para < 100k chaves.
     const pattern = `${this.redis.prefix}:phone:*`;
     let cursor = '0';
     let count = 0;
@@ -240,9 +222,6 @@ class MetricsService {
   // HELPERS DE INSTRUMENTAÇÃO
   // ============================================================
 
-  /**
-   * Envolve uma função async, medindo a duração e registando sucesso/erro.
-   */
   async time(histogram, labels, fn) {
     const end = histogram.startTimer(labels);
     try {
@@ -261,5 +240,4 @@ class MetricsService {
   }
 }
 
-// Singleton — importar em qualquer serviço.
 module.exports = new MetricsService();

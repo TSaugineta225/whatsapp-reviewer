@@ -1,31 +1,32 @@
 // src/services/redis.service.js
-//
-// Wrapper minimalista sobre ioredis.
-// Expõe apenas o que o bot precisa:
-//   - GET / SET / DEL / EXPIRE
-//   - SETNX (locks)
-//   - INCR (rate limit e contadores)
-//   - dedupe(mensagemId)  → atómico
-//   - rateLimit(bucket)   → atómico
-//   - withLock(chave)     → executa um bloco com lock
-
 const Redis = require('ioredis');
+const crypto = require('crypto');
 
 const DEFAULT_URL = 'redis://localhost:6379';
 const DEFAULT_KEY_PREFIX = 'yane';
 
-// Tempos padrão (em segundos)
-const PHONE_MAP_TTL = 2 * 60 * 60;    // 2 horas
-const DEDUPE_TTL = 5 * 60;            // 5 minutos
-const LOCK_TTL = 30;                  // 30 segundos (turno longo)
-const RATE_WINDOW = 1;                // 1 segundo
+const PHONE_MAP_TTL = 2 * 60 * 60; // 2 horas
+const DEDUPE_TTL = 5 * 60;          // 5 minutos
+const LOCK_TTL = 90;                // 90 segundos
+const RATE_WINDOW = 1;              // 1 segundo
+const CONNECT_TIMEOUT = 5000;
+
+// Libera o lock somente se o token ainda pertencer ao proprietário.
+// GET + DEL separados podem sofrer race condition.
+const RELEASE_LOCK_SCRIPT = `
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+  end
+  return 0
+`;
 
 class RedisService {
   constructor() {
     this.client = null;
     this.isReady = false;
-    this.prefix = process.env.REDIS_PREFIX || DEFAULT_KEY_PREFIX;
+    this.initializing = null;
 
+    this.prefix = process.env.REDIS_PREFIX || DEFAULT_KEY_PREFIX;
     this.url = process.env.REDIS_URL || DEFAULT_URL;
   }
 
@@ -34,58 +35,137 @@ class RedisService {
   // ============================================================
 
   async initialize() {
-    if (this.client) return;
+    // Redis já está pronto.
+    if (this.isReady && this.client) return;
 
-    this.client = new Redis(this.url, {
+    // Outra chamada já está inicializando.
+    // Evita múltiplas conexões quando initialize() é chamado
+    // simultaneamente por diferentes partes da aplicação.
+    if (this.initializing) {
+      return this.initializing;
+    }
+
+    this.initializing = this._initialize();
+
+    try {
+      await this.initializing;
+    } finally {
+      this.initializing = null;
+    }
+  }
+
+  async _initialize() {
+    if (this.client) {
+      try {
+        this.client.disconnect();
+      } catch (_) {
+        // Ignorar: estamos apenas limpando uma conexão anterior.
+      }
+    }
+
+    this.isReady = false;
+
+    const client = new Redis(this.url, {
       maxRetriesPerRequest: 3,
       enableReadyCheck: true,
       lazyConnect: false,
       retryStrategy: (times) => Math.min(times * 200, 3000),
     });
 
-    this.client.on('ready', () => {
+    this.client = client;
+
+    client.on('ready', () => {
       this.isReady = true;
       console.log('[REDIS] Pronto.');
     });
 
-    this.client.on('error', (error) => {
+    client.on('error', (error) => {
       this.isReady = false;
       console.error('[REDIS] Erro:', error.message);
     });
 
-    this.client.on('close', () => {
+    client.on('close', () => {
       this.isReady = false;
     });
 
-    // Aguarda primeira ligação
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(
-        () => reject(new Error('Redis timeout na ligação inicial.')),
-        5000
-      );
+    try {
+      await new Promise((resolve, reject) => {
+        let timeout;
 
-      this.client.once('ready', () => {
-        clearTimeout(timeout);
-        resolve();
-      });
+        const cleanup = () => {
+          if (timeout) clearTimeout(timeout);
+          client.removeListener('ready', onReady);
+        };
 
-      this.client.once('error', (err) => {
-        clearTimeout(timeout);
-        reject(err);
+        const onReady = () => {
+          cleanup();
+          resolve();
+        };
+
+        timeout = setTimeout(() => {
+          cleanup();
+
+          try {
+            client.disconnect();
+          } catch (_) {
+            // Ignorar erro durante cleanup.
+          }
+
+          reject(
+            new Error('Redis timeout na ligação inicial.')
+          );
+        }, CONNECT_TIMEOUT);
+
+        client.once('ready', onReady);
       });
-    });
+    } catch (error) {
+      if (this.client === client) {
+        this.client = null;
+        this.isReady = false;
+      }
+
+      throw error;
+    }
   }
 
   async close() {
-    if (!this.client) return;
+    const client = this.client;
+
+    if (!client) return;
+
+    this.client = null;
+    this.isReady = false;
 
     try {
-      await this.client.quit();
+      await client.quit();
     } catch (_) {
-      // Ignorar erro no shutdown.
-    } finally {
-      this.client = null;
-      this.isReady = false;
+      // Em caso de conexão já perdida, não há nada mais a fazer.
+      try {
+        client.disconnect();
+      } catch (_) {
+        // Ignorar erro durante cleanup.
+      }
+    }
+  }
+
+  // ============================================================
+  // HELPERS INTERNOS
+  // ============================================================
+
+  _available() {
+    return Boolean(this.client && this.isReady);
+  }
+
+  async _execute(operation, fallback, fn) {
+    if (!this._available()) {
+      return fallback;
+    }
+
+    try {
+      return await fn(this.client);
+    } catch (error) {
+      console.error(`[REDIS] ${operation} falhou:`, error.message);
+      return fallback;
     }
   }
 
@@ -94,7 +174,9 @@ class RedisService {
   // ============================================================
 
   key(...parts) {
-    return [this.prefix, ...parts].filter(Boolean).join(':');
+    return [this.prefix, ...parts]
+      .filter((part) => part !== undefined && part !== null && part !== '')
+      .join(':');
   }
 
   // ============================================================
@@ -102,152 +184,280 @@ class RedisService {
   // ============================================================
 
   async get(key) {
-    if (!this.isReady) return null;
-    try {
-      return await this.client.get(key);
-    } catch (error) {
-      console.error('[REDIS] GET falhou:', error.message);
-      return null;
-    }
+    return this._execute(
+      'GET',
+      null,
+      (client) => client.get(key)
+    );
   }
 
   async set(key, value, ttlSeconds = null) {
-    if (!this.isReady) return false;
-    try {
-      if (ttlSeconds) {
-        await this.client.set(key, value, 'EX', ttlSeconds);
-      } else {
-        await this.client.set(key, value);
+    return this._execute(
+      'SET',
+      false,
+      async (client) => {
+        if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+          await client.set(key, value, 'EX', ttlSeconds);
+        } else {
+          await client.set(key, value);
+        }
+
+        return true;
       }
-      return true;
-    } catch (error) {
-      console.error('[REDIS] SET falhou:', error.message);
-      return false;
-    }
+    );
   }
 
   async del(key) {
-    if (!this.isReady) return false;
-    try {
-      await this.client.del(key);
-      return true;
-    } catch (error) {
-      console.error('[REDIS] DEL falhou:', error.message);
-      return false;
-    }
+    return this._execute(
+      'DEL',
+      false,
+      async (client) => {
+        await client.del(key);
+        return true;
+      }
+    );
   }
 
   async setnx(key, value, ttlSeconds = null) {
-    if (!this.isReady) return false;
-    try {
-      const result = ttlSeconds
-        ? await this.client.set(key, value, 'EX', ttlSeconds, 'NX')
-        : await this.client.set(key, value, 'NX');
-      return result === 'OK';
-    } catch (error) {
-      console.error('[REDIS] SETNX falhou:', error.message);
-      return false;
-    }
+    return this._execute(
+      'SETNX',
+      false,
+      async (client) => {
+        const result =
+          Number.isFinite(ttlSeconds) && ttlSeconds > 0
+            ? await client.set(key, value, 'EX', ttlSeconds, 'NX')
+            : await client.set(key, value, 'NX');
+
+        return result === 'OK';
+      }
+    );
   }
 
   async incr(key, ttlSeconds = null) {
-    if (!this.isReady) return 0;
-    try {
-      const value = await this.client.incr(key);
-      if (value === 1 && ttlSeconds) {
-        await this.client.expire(key, ttlSeconds);
+    return this._execute(
+      'INCR',
+      0,
+      async (client) => {
+        const value = await client.incr(key);
+
+        // TTL só é aplicado quando a chave acabou de ser criada.
+        // Isso mantém o comportamento de janela atual.
+        if (value === 1 && Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+          await client.expire(key, ttlSeconds);
+        }
+
+        return value;
       }
-      return value;
-    } catch (error) {
-      console.error('[REDIS] INCR falhou:', error.message);
-      return 0;
-    }
+    );
+  }
+
+  // ============================================================
+  // LISTAS (fila de turnos pendentes)
+  // ============================================================
+
+  async lpush(key, value) {
+    return this._execute(
+      'LPUSH',
+      false,
+      async (client) => {
+        await client.lpush(key, value);
+        return true;
+      }
+    );
+  }
+
+  async lpop(key) {
+    return this._execute(
+      'LPOP',
+      null,
+      (client) => client.lpop(key)
+    );
+  }
+
+  async lindex(key, index = 0) {
+    return this._execute(
+      'LINDEX',
+      null,
+      (client) => client.lindex(key, index)
+    );
+  }
+
+  async llen(key) {
+    return this._execute(
+      'LLEN',
+      0,
+      (client) => client.llen(key)
+    );
+  }
+
+  async lset(key, index, value) {
+    return this._execute(
+      'LSET',
+      false,
+      async (client) => {
+        await client.lset(key, index, value);
+        return true;
+      }
+    );
+  }
+
+  // ============================================================
+  // SORTED SETS (índice de telefones pendentes)
+  // ============================================================
+
+  async zadd(key, score, member) {
+    return this._execute(
+      'ZADD',
+      false,
+      async (client) => {
+        await client.zadd(key, score, member);
+        return true;
+      }
+    );
+  }
+
+  async zrem(key, member) {
+    return this._execute(
+      'ZREM',
+      false,
+      async (client) => {
+        await client.zrem(key, member);
+        return true;
+      }
+    );
+  }
+
+  async zrangeByScore(
+    key,
+    min,
+    max,
+    offset = 0,
+    count = 10
+  ) {
+    return this._execute(
+      'ZRANGEBYSCORE',
+      [],
+      (client) =>
+        client.zrangebyscore(
+          key,
+          min,
+          max,
+          'LIMIT',
+          offset,
+          count
+        )
+    );
   }
 
   // ============================================================
   // PHONE ↔ INTERVIEW
   // ============================================================
 
-  async rememberInterview(phone, interviewId, ttl = PHONE_MAP_TTL) {
-    const key = this.key('phone', phone);
-    return this.set(key, String(interviewId), ttl);
+  async rememberInterview(
+    phone,
+    interviewId,
+    ttl = PHONE_MAP_TTL
+  ) {
+    return this.set(
+      this.key('phone', phone),
+      String(interviewId),
+      ttl
+    );
   }
 
   async resolveInterviewId(phone) {
-    const key = this.key('phone', phone);
-    return this.get(key);
+    return this.get(
+      this.key('phone', phone)
+    );
   }
 
   async forgetInterview(phone) {
-    const key = this.key('phone', phone);
-    return this.del(key);
+    return this.del(
+      this.key('phone', phone)
+    );
   }
 
   // ============================================================
-  // DEDUPE DE MENSAGENS
+  // DEDUPE
   // ============================================================
 
-  /**
-   * Devolve `true` se a mensagem é nova (nunca vista) e marca-a.
-   * Devolve `false` se já foi processada (duplicada).
-   *
-   * Usa SET NX atómico. Não há race condition.
-   */
-  async markMessageSeen(messageId, ttl = DEDUPE_TTL) {
+  async markMessageSeen(
+    messageId,
+    ttl = DEDUPE_TTL
+  ) {
+    // Mantém a semântica original:
+    // sem ID não há nada para deduplicar.
     if (!messageId) return true;
 
-    const key = this.key('msg', messageId);
-    return this.setnx(key, '1', ttl);
+    return this.setnx(
+      this.key('msg', messageId),
+      '1',
+      ttl
+    );
   }
 
   // ============================================================
   // LOCK POR TELEFONE
   // ============================================================
 
-  /**
-   * Adquire um lock temporário por telefone.
-   *
-   * Devolve um token se conseguiu, ou null se já está locked.
-   * O caller deve chamar releaseLock() no finally.
-   */
-  async acquireLock(phone, ttl = LOCK_TTL) {
+  async acquireLock(
+    phone,
+    ttl = LOCK_TTL
+  ) {
     const key = this.key('lock', phone);
-    const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-    const acquired = await this.setnx(key, token, ttl);
+    const token = `${Date.now()}-${crypto.randomBytes(16).toString('hex')}`;
+
+    const acquired = await this.setnx(
+      key,
+      token,
+      ttl
+    );
+
     return acquired ? token : null;
   }
 
-  /**
-   * Liberta o lock apenas se ainda formos os donos.
-   * Evita apagar o lock de outro processo que o adquiriu após o TTL.
-   */
   async releaseLock(phone, token) {
-    if (!token) return;
+    if (!token || !this._available()) return;
 
     const key = this.key('lock', phone);
 
     try {
-      const current = await this.client.get(key);
-      if (current === token) {
-        await this.client.del(key);
-      }
-    } catch (_) {
-      // Ignorar.
+      await this.client.eval(
+        RELEASE_LOCK_SCRIPT,
+        1,
+        key,
+        token
+      );
+    } catch (error) {
+      console.error(
+        '[REDIS] RELEASE LOCK falhou:',
+        error.message
+      );
     }
   }
 
   // ============================================================
-  // RATE LIMIT (token bucket simplificado)
+  // RATE LIMIT
   // ============================================================
 
-  /**
-   * Conta quantas operações foram feitas nesta janela (segundo).
-   * Devolve `true` se ainda estamos abaixo do limite.
-   */
-  async allowRate(bucket = 'out', maxPerSecond = 60) {
-    const key = this.key('rate', bucket, Math.floor(Date.now() / 1000));
-    const count = await this.incr(key, RATE_WINDOW + 1);
+  async allowRate(
+    bucket = 'out',
+    maxPerSecond = 60
+  ) {
+    const second = Math.floor(Date.now() / 1000);
+
+    const key = this.key(
+      'rate',
+      bucket,
+      second
+    );
+
+    const count = await this.incr(
+      key,
+      RATE_WINDOW + 1
+    );
+
     return count <= maxPerSecond;
   }
 
@@ -255,13 +465,12 @@ class RedisService {
   // HELPERS
   // ============================================================
 
-  /**
-   * Executa `fn` com um lock por telefone.
-   * Se não conseguir o lock, devolve `null` sem executar.
-   */
   async withPhoneLock(phone, fn) {
     const token = await this.acquireLock(phone);
-    if (!token) return null;
+
+    if (!token) {
+      return null;
+    }
 
     try {
       return await fn();
