@@ -132,3 +132,6 @@ dist
 # cache
 .wwebjs_auth
 .wwebjs_cache
+**/auth_info
+auth_info/
+
