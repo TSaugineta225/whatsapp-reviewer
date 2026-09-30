@@ -1,30 +1,39 @@
+/* eslint-disable no-await-in-loop */
 //
-// Camada de transporte entre WhatsApp e backend Python.
+// Orquestrador do worker de fila e da integração com WhatsApp/backend.
 //
-// [FIXES]
-// [FIX-1] reportUnmatchedIncoming chamado em todos os caminhos órfãos.
-// [FIX-2] isButton propagado ao sendInterviewTurn.
-// [FIX-3] PII (phone, preview) mascarada nos logs.
-// [FIX-4] _reschedulePendingItem respeita error.retryable e retryAfterMs.
-//         Se o erro for definitivo (retryable=false), vai logo para
-//         dead-letter em vez de queimar 10 tentativas.
-// [FIX-5] Fila cheia → fallback com mensagem explícita ao candidato
-//         em vez de descartar silenciosamente.
-// [FIX-6] _processPendingTurns verifica _closing dentro do loop
-//         de telefones.
-// [FIX-7] Helpers rememberLidMapping / resolveLidToPhone expostos
-//         para simetria com WhatsAppService. Delegam ao Redis.
+// [NOTA SOBRE eslint-disable no-await-in-loop]
+// O `await` dentro de loops é intencional em dois sítios:
+//
+//   1. _processPendingTurns: iteramos telefones da fila para
+//      processar cada um sequencialmente. Processar em paralelo
+//      quebraria a ordem FIFO por telefone.
+//
+//   2. _processPhoneQueue: iteramos itens do mesmo telefone. Cada
+//      item tem de terminar antes do próximo começar; é assim que
+//      a entrega pendente (kind=delivery) não é ultrapassada por
+//      um novo turno.
+//
+// O disable existe para não voltar a discutir isto. Não remover
+// sem antes garantir que a serialização é mantida por outro meio.
+//
+// [FIX-QUEUE-1]
+//   _metricSet passa labels só quando não vazios. Antes desta
+//   revisão, métricas sem labels (deadLetterDepth) recebiam
+//   `set({}, valor)` e o prom-client tratava `{}` como o valor,
+//   ignorando o argumento real. Métricas com labels continuam a
+//   funcionar como antes.
 //
 // Responsabilidades:
-//   - FIFO lógico por telefone
-//   - lock distribuído por telefone
-//   - dedupe de mensagens recebidas
-//   - retry do backend com backoff
-//   - retry da entrega WhatsApp sem repetir o backend
-//   - limite de fila por telefone
-//   - dead-letter para falhas persistentes
-//   - renovação de lock em operações longas
-//   - shutdown seguro do worker
+//   - FIFO lógico por telefone;
+//   - lock distribuído por telefone;
+//   - dedupe de mensagens recebidas;
+//   - retry do backend com backoff;
+//   - retry da entrega WhatsApp sem repetir o backend;
+//   - limite de fila por telefone;
+//   - dead-letter para falhas persistentes;
+//   - renovação de lock em operações longas;
+//   - shutdown seguro do worker.
 
 'use strict';
 
@@ -36,47 +45,46 @@ const YaneIntegrationService = require('./yane-integration.service');
 const metrics = require('./metrics.service');
 
 // =============================================================================
-// CONFIG
+// CONFIGURAÇÃO
 // =============================================================================
 
-const DEFAULT_TYPING_MS_PER_CHAR = 22;
-const DEFAULT_TYPING_MAX_MS = 2_600;
+const CONFIG = Object.freeze({
+  typingMsPerChar: 22,
+  typingMaxMs: 2_600,
 
-const PENDING_PHONES_KEY = 'pending:phones';
-const PENDING_TURN_KEY_PREFIX = 'pending:turn';
-const DEAD_LETTER_KEY = 'dead:interview';
+  pendingPhonesKey: 'pending:phones',
+  pendingTurnKeyPrefix: 'pending:turn',
+  deadLetterKey: 'dead:interview',
+  queueSchemaVersion: 1,
 
-const QUEUE_SCHEMA_VERSION = 1;
+  pendingMaxAttempts: 10,
+  maxPendingPerPhone: 20,
 
-const PENDING_MAX_ATTEMPTS = 10;
-const MAX_PENDING_PER_PHONE = 20;
+  backoffBaseMs: 30_000,
+  backoffMaxMs: 15 * 60_000,
+  deadLetterRetryMs: 60 * 60_000,
 
-const PENDING_BACKOFF_BASE_MS = 30_000;
-const PENDING_BACKOFF_MAX_MS = 15 * 60_000;
+  workerIntervalMs: 10_000,
+  workerBatchSize: 20,
+  workerMaxPerPhone: 3,
 
-const DEAD_LETTER_RETRY_MS = 60 * 60_000;
+  lockTtlSeconds: 300,
+  lockRefreshMs: 30_000,
 
-const WORKER_INTERVAL_MS = 10_000;
-const WORKER_BATCH_SIZE = 20;
-const WORKER_MAX_PER_PHONE = 3;
+  deadLetterReportIntervalMs: 60 * 60_000,
+  maxLookupAttempts: 5,
 
-const WORKER_LOCK_TTL = 300;
-const WORKER_LOCK_REFRESH_MS = 60_000;
+  softRecoveryMessage: 'Um momento, por favor. Já lhe respondo.',
+  queueFullMessage:
+    'Recebi a sua mensagem, mas estou com muitos pedidos. ' +
+    'Vou responder assim que possível.',
 
-const MAX_LOOKUP_ATTEMPTS = 5;
+  fallbackCooldownMs: 60_000,
+  fallbackSweepThreshold: 1_000,
+  fallbackHardLimit: 5_000,
 
-const SOFT_RECOVERY_MESSAGE = 'Um momento, por favor. Já lhe respondo.';
-
-// [FIX-5] Mensagem enviada quando a fila está cheia.
-const QUEUE_FULL_MESSAGE =
-  'Recebi a sua mensagem, mas estou com muitos pedidos. ' +
-  'Vou responder assim que possível.';
-
-const FALLBACK_COOLDOWN_MS = 60_000;
-const FALLBACK_MAP_SWEEP_THRESHOLD = 1_000;
-const FALLBACK_MAP_HARD_LIMIT = 5_000;
-
-const BUBBLE_PAUSE_MS = 300;
+  bubblePauseMs: 300,
+});
 
 // =============================================================================
 // HELPERS
@@ -116,10 +124,8 @@ function normalizePhone(phone) {
   return '';
 }
 
-// [FIX-3] helper de masking para logs.
 function maskPhone(phone) {
   const normalized = normalizePhone(phone) || String(phone || '');
-
   const digits = normalized.replace(/\D/g, '');
 
   if (digits.length < 6) {
@@ -129,6 +135,16 @@ function maskPhone(phone) {
   return `${digits.slice(0, 3)}***${digits.slice(-3)}`;
 }
 
+function maskIdentifier(value) {
+  const raw = String(value ?? '');
+
+  if (raw.length <= 6) {
+    return '***';
+  }
+
+  return `${raw.slice(0, 3)}***${raw.slice(-3)}`;
+}
+
 function safeNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
@@ -136,25 +152,34 @@ function safeNumber(value, fallback) {
 
 function errorMessage(error) {
   return clean(
-    error?.message || error?.error || 'unknown_error'
+    error?.message ||
+      error?.error ||
+      'unknown_error'
   ).slice(0, 500);
 }
 
-// [FIX-4] extrai retryAfterMs de um YaneIntegrationError.
 function getRetryAfterMs(error) {
   const value = Number(error?.retryAfterMs);
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
-// [FIX-4] determina se vale a pena retentar.
 function isRetryableError(error) {
-  // Erros tipados têm retryable explícito.
   if (typeof error?.retryable === 'boolean') {
     return error.retryable;
   }
 
-  // Fallback: qualquer coisa sem classificação é retentável.
   return true;
+}
+
+function isFailedSendResult(result) {
+  return (
+    result === false ||
+    (
+      result &&
+      typeof result === 'object' &&
+      result.status === 'failed'
+    )
+  );
 }
 
 // =============================================================================
@@ -176,7 +201,7 @@ class InterviewService {
       0,
       safeNumber(
         process.env.WHATSAPP_TYPING_MS_PER_CHAR,
-        DEFAULT_TYPING_MS_PER_CHAR
+        CONFIG.typingMsPerChar
       )
     );
 
@@ -184,7 +209,7 @@ class InterviewService {
       0,
       safeNumber(
         process.env.WHATSAPP_TYPING_MAX_MS,
-        DEFAULT_TYPING_MAX_MS
+        CONFIG.typingMaxMs
       )
     );
 
@@ -194,10 +219,12 @@ class InterviewService {
     this._lifecycleGeneration = 0;
 
     this._workerTimer = null;
+    this._deadLetterTimer = null;
     this._workerRunning = false;
     this._workerPromise = null;
 
     this._fallbackSentAt = new Map();
+    this._fallbackInFlight = new Set();
 
     this.logger = pino({
       level: process.env.LOG_LEVEL || 'info',
@@ -206,7 +233,7 @@ class InterviewService {
   }
 
   // ===========================================================================
-  // LOGGING
+  // LOGGING / MÉTRICAS
   // ===========================================================================
 
   _log(level, message, context = {}) {
@@ -217,13 +244,16 @@ class InterviewService {
         return;
       }
 
-      method.call(this.logger, context, message);
+      method.call(
+        this.logger,
+        context,
+        message
+      );
     } catch (_) {
-      // Logging nunca deve interromper a pipeline.
+      // Logging é best-effort e nunca deve interromper a pipeline.
     }
   }
 
-  // [FIX-3] masking de PII no contexto de log.
   _logContext(phone, extra = {}) {
     const context = {};
 
@@ -236,13 +266,21 @@ class InterviewService {
         continue;
       }
 
-      if (key === 'preview' || key === 'message' || key === 'body') {
-        // Nunca registar conteúdo.
+      // Nunca escrever conteúdo de mensagem/preview no log.
+      if (
+        key === 'preview' ||
+        key === 'message' ||
+        key === 'body'
+      ) {
         continue;
       }
 
-      if (key === 'remoteJid' || key === 'jid') {
-        context[key] = maskPhone(value);
+      if (
+        key === 'remoteJid' ||
+        key === 'jid' ||
+        key === 'lid'
+      ) {
+        context[key] = maskIdentifier(value);
         continue;
       }
 
@@ -252,29 +290,83 @@ class InterviewService {
     return context;
   }
 
+  _metricIncrement(name, labels = {}) {
+    try {
+      metrics[name]?.inc?.(labels);
+    } catch (_) {
+      // Observabilidade não pode quebrar a aplicação.
+    }
+  }
+
+  // [FIX-QUEUE-1] Só passa labels quando existem. Uma gauge sem
+  // labelNames não aceita `set({}, value)` — o prom-client
+  // interpreta `{}` como o valor e descarta o argumento real.
+  _metricSet(name, value, labels = null) {
+    try {
+      const metric = metrics[name];
+
+      if (!metric || typeof metric.set !== 'function') {
+        return;
+      }
+
+      const hasLabels =
+        labels &&
+        typeof labels === 'object' &&
+        Object.keys(labels).length > 0;
+
+      if (hasLabels) {
+        metric.set(labels, value);
+      } else {
+        metric.set(value);
+      }
+    } catch (_) {
+      // Observabilidade não pode quebrar a aplicação.
+    }
+  }
+
   log(message, phone = null, extra = {}) {
-    this._log('info', message, this._logContext(phone, extra));
+    this._log(
+      'info',
+      message,
+      this._logContext(phone, extra)
+    );
   }
 
   logWarn(message, phone = null, extra = {}) {
-    this._log('warn', message, this._logContext(phone, extra));
+    this._log(
+      'warn',
+      message,
+      this._logContext(phone, extra)
+    );
   }
 
-  logError(message, error = null, phone = null, extra = {}) {
-    const context = this._logContext(phone, extra);
+  logError(
+    message,
+    error = null,
+    phone = null,
+    extra = {}
+  ) {
+    const context = this._logContext(
+      phone,
+      extra
+    );
 
     if (error) {
       context.error = errorMessage(error);
       context.code = error?.code || null;
       context.status = error?.status || null;
-      context.retryable = error?.retryable || false;
+      context.retryable = isRetryableError(error);
     }
 
     this._log('error', message, context);
   }
 
   logDebug(message, phone = null, extra = {}) {
-    this._log('debug', message, this._logContext(phone, extra));
+    this._log(
+      'debug',
+      message,
+      this._logContext(phone, extra)
+    );
   }
 
   // ===========================================================================
@@ -290,11 +382,13 @@ class InterviewService {
       return this._initializing;
     }
 
-    const generation = ++this._lifecycleGeneration;
+    const generation =
+      ++this._lifecycleGeneration;
 
     this._closing = false;
 
-    this._initializing = this._initialize(generation);
+    this._initializing =
+      this._initialize(generation);
 
     try {
       await this._initializing;
@@ -306,13 +400,13 @@ class InterviewService {
   async _initialize(generation) {
     await this.redis.initialize();
 
-    if (this._closing || generation !== this._lifecycleGeneration) {
+    if (this._isStaleLifecycle(generation)) {
       return;
     }
 
     await this._checkBackendHealthAtBoot();
 
-    if (this._closing || generation !== this._lifecycleGeneration) {
+    if (this._isStaleLifecycle(generation)) {
       return;
     }
 
@@ -321,20 +415,38 @@ class InterviewService {
     this._startWorker();
     this._triggerWorker();
 
-    this.log('InterviewService inicializado.');
+    this.log(
+      'InterviewService inicializado.'
+    );
+  }
+
+  _isStaleLifecycle(generation) {
+    return (
+      this._closing ||
+      generation !== this._lifecycleGeneration
+    );
   }
 
   async _checkBackendHealthAtBoot() {
-    if (typeof this.yane?.healthCheck !== 'function') {
-      this.logWarn('yane.healthCheck() indisponível no boot.');
+    if (
+      typeof this.yane?.healthCheck !==
+      'function'
+    ) {
+      this.logWarn(
+        'yane.healthCheck() indisponível no boot.'
+      );
+
       return;
     }
 
     try {
-      const healthy = await this.yane.healthCheck();
+      const healthy =
+        await this.yane.healthCheck();
 
       if (healthy) {
-        this.log('Backend Python saudável no boot.');
+        this.log(
+          'Backend Python saudável no boot.'
+        );
       } else {
         this.logWarn(
           'Backend Python não respondeu ao health check no boot.'
@@ -362,7 +474,10 @@ class InterviewService {
       try {
         await this._workerPromise;
       } catch (error) {
-        this.logError('Erro durante shutdown do worker.', error);
+        this.logError(
+          'Erro durante shutdown do worker.',
+          error
+        );
       }
     }
 
@@ -372,14 +487,18 @@ class InterviewService {
       try {
         await this.redis.close();
       } catch (error) {
-        this.logError('Erro ao fechar Redis.', error);
+        this.logError(
+          'Erro ao fechar Redis.',
+          error
+        );
       }
     }
 
-    this.log('InterviewService encerrado.');
+    this.log(
+      'InterviewService encerrado.'
+    );
   }
 
-  // Exposto para ser chamado por fora (shutdown, tests, manutenção).
   invalidatePendingInitialize() {
     ++this._lifecycleGeneration;
     this._initializing = null;
@@ -390,27 +509,45 @@ class InterviewService {
   }
 
   _getWhatsAppService() {
-    return this.whatsapp || global.whatsappService || null;
+    return (
+      this.whatsapp ||
+      global.whatsappService ||
+      null
+    );
   }
 
-  _isWhatsAppReady(client = this._getWhatsAppService()) {
-    if (!client) return false;
+  _isWhatsAppReady(
+    client = this._getWhatsAppService()
+  ) {
+    if (!client) {
+      return false;
+    }
 
     if (typeof client.isReady === 'boolean') {
       return client.isReady;
     }
 
-    return typeof client.sendMessage === 'function';
+    return (
+      typeof client.sendMessage ===
+      'function'
+    );
   }
 
   // ===========================================================================
   // MAPEAMENTO PHONE ↔ INTERVIEW
   // ===========================================================================
 
-  async rememberInterview(phone, interviewId) {
-    const normalizedPhone = normalizePhone(phone);
+  async rememberInterview(
+    phone,
+    interviewId
+  ) {
+    const normalizedPhone =
+      normalizePhone(phone);
 
-    if (!normalizedPhone || !interviewId) {
+    if (
+      !normalizedPhone ||
+      !interviewId
+    ) {
       return false;
     }
 
@@ -434,7 +571,8 @@ class InterviewService {
   }
 
   async resolveInterviewId(phone) {
-    const normalizedPhone = normalizePhone(phone);
+    const normalizedPhone =
+      normalizePhone(phone);
 
     if (!normalizedPhone) {
       return null;
@@ -442,7 +580,12 @@ class InterviewService {
 
     try {
       return (
-        (await this.redis.resolveInterviewId(normalizedPhone)) || null
+        (
+          await this.redis
+            .resolveInterviewId(
+              normalizedPhone
+            )
+        ) || null
       );
     } catch (error) {
       this.logError(
@@ -456,13 +599,18 @@ class InterviewService {
   }
 
   async forgetInterview(phone) {
-    const normalizedPhone = normalizePhone(phone);
+    const normalizedPhone =
+      normalizePhone(phone);
 
-    if (!normalizedPhone) return false;
+    if (!normalizedPhone) {
+      return false;
+    }
 
     try {
       return Boolean(
-        await this.redis.forgetInterview(normalizedPhone)
+        await this.redis.forgetInterview(
+          normalizedPhone
+        )
       );
     } catch (error) {
       this.logError(
@@ -476,21 +624,27 @@ class InterviewService {
   }
 
   // ===========================================================================
-  // [FIX-7] MAPEAMENTO LID → PHONE
-  //
-  // Simetria com WhatsAppService. Normalmente é o WhatsAppService
-  // que persiste o mapping ao enviar o convite, mas estes helpers
-  // permitem consulta/reparação a partir de scripts.
+  // MAPEAMENTO LID → PHONE
   // ===========================================================================
 
-  async rememberLidMapping(lidJid, phone) {
+  async rememberLidMapping(
+    lidJid,
+    phone
+  ) {
     try {
-      if (typeof this.redis.rememberLidMapping !== 'function') {
+      if (
+        typeof this.redis
+          .rememberLidMapping !==
+        'function'
+      ) {
         return false;
       }
 
       return Boolean(
-        await this.redis.rememberLidMapping(lidJid, phone)
+        await this.redis.rememberLidMapping(
+          lidJid,
+          phone
+        )
       );
     } catch (error) {
       this.logError(
@@ -506,11 +660,16 @@ class InterviewService {
 
   async resolveLidToPhone(lidJid) {
     try {
-      if (typeof this.redis.resolveLidMapping !== 'function') {
+      if (
+        typeof this.redis
+          .resolveLidMapping !==
+        'function'
+      ) {
         return null;
       }
 
-      return await this.redis.resolveLidMapping(lidJid);
+      return await this.redis
+        .resolveLidMapping(lidJid);
     } catch (error) {
       this.logError(
         'Falha ao consultar LID no Redis.',
@@ -525,12 +684,18 @@ class InterviewService {
 
   async forgetLidMapping(lidJid) {
     try {
-      if (typeof this.redis.forgetLidMapping !== 'function') {
+      if (
+        typeof this.redis
+          .forgetLidMapping !==
+        'function'
+      ) {
         return false;
       }
 
       return Boolean(
-        await this.redis.forgetLidMapping(lidJid)
+        await this.redis.forgetLidMapping(
+          lidJid
+        )
       );
     } catch (error) {
       this.logError(
@@ -545,11 +710,12 @@ class InterviewService {
   }
 
   // ===========================================================================
-  // START
+  // INÍCIO DA ENTREVISTA
   // ===========================================================================
 
   async startInterview(payload = {}) {
-    const phone = normalizePhone(payload.phone);
+    const phone =
+      normalizePhone(payload.phone);
 
     const interviewId =
       payload.interviewId ||
@@ -557,57 +723,107 @@ class InterviewService {
       null;
 
     const initialMessage = clean(
-      payload.initialMessage || payload.initial_message
+      payload.initialMessage ||
+      payload.initial_message
     );
 
-    if (!phone || !interviewId || !initialMessage) {
-      this.logWarn('startInterview ignorado: payload inválido.', phone, {
-        interviewId,
-        hasMessage: Boolean(initialMessage),
-      });
+    if (
+      !phone ||
+      !interviewId ||
+      !initialMessage
+    ) {
+      this.logWarn(
+        'startInterview ignorado: payload inválido.',
+        phone,
+        {
+          interviewId,
+          hasMessage:
+            Boolean(initialMessage),
+        }
+      );
 
-      return { success: false, reason: 'invalid_payload' };
+      return {
+        success: false,
+        reason: 'invalid_payload',
+      };
     }
 
-    const mapped = await this.rememberInterview(phone, interviewId);
+    const mapped =
+      await this.rememberInterview(
+        phone,
+        interviewId
+      );
 
     if (!mapped) {
-      metrics.errorsTotal.inc({ subsystem: 'redis' });
+      this._metricIncrement(
+        'errorsTotal',
+        { subsystem: 'redis' }
+      );
 
-      return { success: false, reason: 'state_unavailable' };
+      return {
+        success: false,
+        reason: 'state_unavailable',
+      };
     }
 
-    metrics.interviewsStarted.inc();
+    this._metricIncrement(
+      'interviewsStarted'
+    );
 
-    const delivery = await this._sendText(phone, initialMessage);
+    const delivery =
+      await this._sendText(
+        phone,
+        initialMessage
+      );
 
     if (delivery.ok) {
-      this.log('Convite enviado.', phone, { interviewId });
+      this.log(
+        'Convite enviado.',
+        phone,
+        { interviewId }
+      );
 
-      return { success: true, interviewId, phone };
+      return {
+        success: true,
+        interviewId,
+        phone,
+      };
     }
 
-    const queued = await this._enqueuePendingDelivery({
-      phone,
-      bubbles: delivery.remaining,
-      interviewId,
-      turnId: randomUUID(),
-      finished: false,
-      interviewStatus: 'in_progress',
-    });
+    const queued =
+      await this._enqueuePendingDelivery({
+        phone,
+        bubbles: delivery.remaining,
+        interviewId,
+        turnId: randomUUID(),
+        finished: false,
+        interviewStatus:
+          'in_progress',
+      });
 
     if (queued === 1) {
-      metrics.interviewsQueued.inc();
+      this._metricIncrement(
+        'interviewsQueued'
+      );
     } else {
-      metrics.errorsTotal.inc({ subsystem: 'redis' });
+      this._metricIncrement(
+        'errorsTotal',
+        { subsystem: 'redis' }
+      );
 
-      await this._safeSendFallback(phone);
+      await this._safeSendFallback(
+        phone
+      );
     }
 
-    this.logWarn('Convite não entregue.', phone, {
-      interviewId,
-      queued: queued === 1,
-    });
+    this.logWarn(
+      'Convite não entregue.',
+      phone,
+      {
+        interviewId,
+        queued: queued === 1,
+      }
+    );
 
     return {
       success: true,
@@ -621,103 +837,105 @@ class InterviewService {
   // MENSAGEM RECEBIDA
   // ===========================================================================
 
-  async handleIncomingMessage(from, text, options = {}) {
+  async handleIncomingMessage(
+    from,
+    text,
+    options = {}
+  ) {
     const phone = normalizePhone(from);
     const message = clean(text);
-    const messageId = options.messageId || null;
+    const messageId =
+      options.messageId || null;
+    const isButton =
+      Boolean(options.isButton);
 
     if (!phone || !message) {
-      return { handled: false, reason: 'empty' };
+      return {
+        handled: false,
+        reason: 'empty',
+      };
     }
 
-    // -------------------------------------------------------------------------
-    // REDIS
-    // -------------------------------------------------------------------------
-
-    try {
-      if (
-        typeof this.redis.isAvailable === 'function' &&
-        !this.redis.isAvailable()
-      ) {
-        throw new Error('redis_unavailable');
-      }
-    } catch (error) {
-      metrics.errorsTotal.inc({ subsystem: 'redis' });
+    if (!this._isRedisAvailable()) {
+      this._metricIncrement(
+        'errorsTotal',
+        { subsystem: 'redis' }
+      );
 
       this.logError(
         'Redis indisponível — mensagem não processável.',
-        error,
+        new Error(
+          'redis_unavailable'
+        ),
         phone,
         { msgId: messageId }
       );
 
-      await this._safeSendFallback(phone);
+      await this._safeSendFallback(
+        phone
+      );
 
       return {
         handled: true,
         queued: false,
         degraded: true,
-        reason: 'redis_unavailable',
+        reason:
+          'redis_unavailable',
       };
     }
 
-    // -------------------------------------------------------------------------
-    // DEDUPE
-    // -------------------------------------------------------------------------
+    const dedupeResult =
+      await this._handleDedupe(
+        phone,
+        messageId
+      );
 
-    if (messageId) {
-      let isNew;
-
-      try {
-        isNew = await this.redis.markMessageSeen(messageId);
-      } catch (error) {
-        metrics.errorsTotal.inc({ subsystem: 'redis' });
-
-        this.logError(
-          'Falha no dedupe da mensagem.',
-          error,
-          phone,
-          { msgId: messageId }
-        );
-
-        await this._safeSendFallback(phone);
-
-        return {
-          handled: true,
-          queued: false,
-          degraded: true,
-          reason: 'dedupe_unavailable',
-        };
-      }
-
-      if (!isNew) {
-        metrics.turnsTotal.inc({ status: 'duplicate' });
-
-        this.logDebug('Mensagem duplicada ignorada.', phone, {
-          msgId: messageId,
-        });
-
-        return { handled: false, reason: 'duplicate' };
-      }
+    if (
+      dedupeResult ===
+      'duplicate'
+    ) {
+      return {
+        handled: false,
+        reason: 'duplicate',
+      };
     }
 
-    // -------------------------------------------------------------------------
-    // LOCK
-    // -------------------------------------------------------------------------
+    if (
+      dedupeResult ===
+      'unavailable'
+    ) {
+      await this._safeSendFallback(
+        phone
+      );
+
+      return {
+        handled: true,
+        queued: false,
+        degraded: true,
+        reason:
+          'dedupe_unavailable',
+      };
+    }
 
     let result;
 
     try {
-      result = await this._withPhoneLock(phone, () =>
-        this._handleLockedMessage({
+      result =
+        await this._withPhoneLock(
           phone,
-          message,
-          messageId,
-          isButton: Boolean(options.isButton),
-        })
-      );
+          () =>
+            this._handleLockedMessage({
+              phone,
+              message,
+              messageId,
+              isButton,
+            })
+        );
     } catch (error) {
-      metrics.errorsTotal.inc({ subsystem: 'redis' });
+      this._metricIncrement(
+        'errorsTotal',
+        { subsystem: 'redis' }
+      );
 
       this.logError(
         'Erro ao executar mensagem sob lock.',
@@ -729,35 +947,93 @@ class InterviewService {
       result = null;
     }
 
-    if (result === null) {
-      const queued = await this._queueIncomingTurn({
+    if (result !== null) {
+      return result;
+    }
+
+    const queued =
+      await this._queueIncomingTurn({
         phone,
         message,
         messageId,
+        isButton,
         reason: 'lock_busy',
       });
 
-      if (queued === 1) {
-        metrics.turnsTotal.inc({ status: 'queued' });
-
-        return {
-          handled: true,
-          queued: true,
-          reason: 'lock_busy',
-        };
-      }
-
-      await this._forgetMessageSeen(messageId);
-      await this._safeSendFallback(phone);
+    if (queued === 1) {
+      this._metricIncrement(
+        'turnsTotal',
+        { status: 'queued' }
+      );
 
       return {
         handled: true,
-        queued: false,
-        reason: 'queue_unavailable',
+        queued: true,
+        reason: 'lock_busy',
       };
     }
 
-    return result;
+    await this._forgetMessageSeen(
+      messageId
+    );
+
+    await this._safeSendFallback(
+      phone
+    );
+
+    return {
+      handled: true,
+      queued: false,
+      reason:
+        'queue_unavailable',
+    };
+  }
+
+  async _handleDedupe(
+    phone,
+    messageId
+  ) {
+    if (!messageId) {
+      return 'new';
+    }
+
+    try {
+      const isNew =
+        await this.redis.markMessageSeen(
+          messageId
+        );
+
+      if (!isNew) {
+        this._metricIncrement(
+          'turnsTotal',
+          { status: 'duplicate' }
+        );
+
+        this.logDebug(
+          'Mensagem duplicada ignorada.',
+          phone,
+          { msgId: messageId }
+        );
+
+        return 'duplicate';
+      }
+
+      return 'new';
+    } catch (error) {
+      this._metricIncrement(
+        'errorsTotal',
+        { subsystem: 'redis' }
+      );
+
+      this.logError(
+        'Falha no dedupe da mensagem.',
+        error,
+        phone,
+        { msgId: messageId }
+      );
+
+      return 'unavailable';
+    }
   }
 
   async _handleLockedMessage({
@@ -766,113 +1042,96 @@ class InterviewService {
     messageId,
     isButton = false,
   }) {
-    // -------------------------------------------------------------------------
-    // Preservar FIFO.
-    // -------------------------------------------------------------------------
-
-    const pending = await this._pendingCount(phone);
+    // Preserva FIFO:
+    // se já existem itens pendentes,
+    // a nova mensagem entra atrás.
+    const pending =
+      await this._pendingCount(phone);
 
     if (pending > 0) {
-      const queued = await this._queueIncomingTurn({
-        phone,
-        message,
-        messageId,
-        reason: 'pending_queue',
-      });
+      const queued =
+        await this._queueIncomingTurn({
+          phone,
+          message,
+          messageId,
+          isButton,
+          reason:
+            'pending_queue',
+        });
 
       if (queued === 1) {
-        metrics.turnsTotal.inc({ status: 'queued' });
+        this._metricIncrement(
+          'turnsTotal',
+          { status: 'queued' }
+        );
 
         return {
           handled: true,
           queued: true,
-          reason: 'pending_queue',
+          reason:
+            'pending_queue',
         };
       }
 
-      await this._forgetMessageSeen(messageId);
-      await this._safeSendFallback(phone);
+      await this._forgetMessageSeen(
+        messageId
+      );
+
+      await this._safeSendFallback(
+        phone
+      );
 
       return {
         handled: true,
         queued: false,
-        reason: 'queue_unavailable',
+        reason:
+          'queue_unavailable',
       };
     }
 
     const turnId = randomUUID();
 
-    // -------------------------------------------------------------------------
-    // Resolver entrevista
-    // -------------------------------------------------------------------------
-
-    let interviewId = await this.resolveInterviewId(phone);
-
-    if (!interviewId) {
-      try {
-        const active = await this.yane.findActiveInterviewByPhone(
-          phone
-        );
-
-        if (active?.id) {
-          interviewId = active.id;
-
-          await this.rememberInterview(phone, interviewId);
-        }
-      } catch (error) {
-        metrics.errorsTotal.inc({ subsystem: 'backend' });
-
-        this.logWarn(
-          'Lookup da entrevista falhou — turno em fila.',
-          phone,
-          {
-            msgId: messageId,
-            turnId,
-            error: errorMessage(error),
-          }
-        );
-
-        const queued = await this._queueIncomingTurn({
-          phone,
+    const resolution =
+      await this._resolveInterviewForIncoming(
+        phone,
+        {
           message,
           messageId,
           turnId,
-          interviewId: null,
-          reason: 'lookup_failed',
-        });
-
-        if (queued === 1) {
-          metrics.turnsTotal.inc({ status: 'queued' });
-
-          return {
-            handled: true,
-            queued: true,
-            reason: 'lookup_failed',
-          };
+          isButton,
         }
+      );
 
-        await this._forgetMessageSeen(messageId);
-        await this._safeSendFallback(phone);
-
-        return {
-          handled: true,
-          queued: false,
-          reason: 'state_unavailable',
-        };
-      }
+    if (
+      resolution.status ===
+      'queued'
+    ) {
+      return {
+        handled: true,
+        queued: true,
+        reason:
+          resolution.reason,
+      };
     }
 
-    if (!interviewId) {
-      metrics.turnsTotal.inc({ status: 'no_interview' });
+    if (
+      resolution.status !==
+      'found'
+    ) {
+      this._metricIncrement(
+        'turnsTotal',
+        { status: 'no_interview' }
+      );
 
       this.logWarn(
         'Sem entrevista activa para o telefone — reportando órfã.',
         phone,
-        { msgId: messageId }
+        {
+          msgId: messageId,
+          turnId,
+        }
       );
 
-      // [FIX-1] reportar ao backend antes de descartar.
-      // Best-effort: não bloqueia nem propaga erro.
       void this._reportOrphan({
         phone,
         message,
@@ -881,38 +1140,31 @@ class InterviewService {
 
       return {
         handled: false,
-        reason: 'no_active_interview',
+        reason:
+          'no_active_interview',
       };
     }
 
-    // -------------------------------------------------------------------------
-    // Backend
-    // -------------------------------------------------------------------------
+    const interviewId =
+      resolution.interviewId;
 
     let turn;
 
     try {
-      turn = await metrics.time(
-        metrics.turnDuration,
-        { endpoint: 'turn' },
-        () =>
-          this.yane.sendInterviewTurn({
-            interviewId,
-            phone,
-            message,
-            turnId,
-            messageId,
-            // [FIX-2] propagar isButton
-            isButton,
-          })
-      );
-
-      if (!turn) {
-        throw new Error('backend_empty_response');
-      }
+      turn =
+        await this._sendInterviewTurn({
+          interviewId,
+          phone,
+          message,
+          messageId,
+          turnId,
+          isButton,
+        });
     } catch (error) {
-      metrics.turnsTotal.inc({ status: 'queued' });
-      metrics.errorsTotal.inc({ subsystem: 'backend' });
+      this._metricIncrement(
+        'errorsTotal',
+        { subsystem: 'backend' }
+      );
 
       this.logWarn(
         'Backend indisponível — turno em fila.',
@@ -921,23 +1173,33 @@ class InterviewService {
           interviewId,
           turnId,
           msgId: messageId,
-          error: errorMessage(error),
-          retryable: error?.retryable !== false,
+          error:
+            errorMessage(error),
+          retryable:
+            isRetryableError(error),
         }
       );
 
-      const queued = await this._queueIncomingTurn({
-        phone,
-        message,
-        messageId,
-        turnId,
-        interviewId,
-        reason: 'backend_error',
-      });
+      const queued =
+        await this._queueIncomingTurn({
+          phone,
+          message,
+          messageId,
+          isButton,
+          turnId,
+          interviewId,
+          reason:
+            'backend_error',
+        });
 
       if (queued !== 1) {
-        await this._forgetMessageSeen(messageId);
-        await this._safeSendFallback(phone);
+        await this._forgetMessageSeen(
+          messageId
+        );
+
+        await this._safeSendFallback(
+          phone
+        );
       }
 
       return {
@@ -950,73 +1212,263 @@ class InterviewService {
       };
     }
 
-    // -------------------------------------------------------------------------
-    // Resposta
-    // -------------------------------------------------------------------------
+    return this._handleTurnResponse({
+      phone,
+      interviewId,
+      turnId,
+      turn,
+    });
+  }
 
-    const bubbles = this._extractBubbles(turn?.bubbles);
-    const finished = Boolean(turn?.finished);
-    const interviewStatus = turn?.interview_status || 'in_progress';
+  async _resolveInterviewForIncoming(
+    phone,
+    {
+      message,
+      messageId,
+      turnId,
+      isButton = false,
+    }
+  ) {
+    let interviewId =
+      await this.resolveInterviewId(
+        phone
+      );
+
+    if (interviewId) {
+      return {
+        status: 'found',
+        interviewId,
+      };
+    }
+
+    try {
+      const active =
+        await this.yane
+          .findActiveInterviewByPhone(
+            phone
+          );
+
+      if (active?.id) {
+        interviewId = active.id;
+
+        await this.rememberInterview(
+          phone,
+          interviewId
+        );
+
+        return {
+          status: 'found',
+          interviewId,
+        };
+      }
+    } catch (error) {
+      this._metricIncrement(
+        'errorsTotal',
+        { subsystem: 'backend' }
+      );
+
+      this.logWarn(
+        'Lookup da entrevista falhou — turno em fila.',
+        phone,
+        {
+          msgId: messageId,
+          turnId,
+          error:
+            errorMessage(error),
+        }
+      );
+
+      const queued =
+        await this._queueIncomingTurn({
+          phone,
+          message,
+          messageId,
+          isButton,
+          turnId,
+          interviewId: null,
+          reason:
+            'lookup_failed',
+        });
+
+      if (queued === 1) {
+        return {
+          status: 'queued',
+          reason:
+            'lookup_failed',
+        };
+      }
+
+      await this._forgetMessageSeen(
+        messageId
+      );
+
+      await this._safeSendFallback(
+        phone
+      );
+
+      return {
+        status: 'unavailable',
+      };
+    }
+
+    return {
+      status: 'none',
+    };
+  }
+
+  async _sendInterviewTurn({
+    interviewId,
+    phone,
+    message,
+    messageId,
+    turnId,
+    isButton,
+  }) {
+    const turn =
+      await metrics.time(
+        metrics.turnDuration,
+        {
+          endpoint: 'turn',
+        },
+        () =>
+          this.yane.sendInterviewTurn({
+            interviewId,
+            phone,
+            message,
+            turnId,
+            messageId,
+            isButton,
+          })
+      );
+
+    if (!turn) {
+      throw new Error(
+        'backend_empty_response'
+      );
+    }
+
+    return turn;
+  }
+
+  async _handleTurnResponse({
+    phone,
+    interviewId,
+    turnId,
+    turn,
+  }) {
+    const bubbles =
+      this._extractBubbles(
+        turn?.bubbles
+      );
+
+    const finished =
+      Boolean(turn?.finished);
+
+    const interviewStatus =
+      turn?.interview_status ||
+      'in_progress';
 
     if (finished) {
-      await this.forgetInterview(phone);
+      await this.forgetInterview(
+        phone
+      );
 
-      metrics.interviewsFinished.inc({ status: interviewStatus });
+      this._metricIncrement(
+        'interviewsFinished',
+        {
+          status:
+            interviewStatus,
+        }
+      );
 
-      this.log('Entrevista terminada.', phone, {
-        interviewId,
-        status: interviewStatus,
-        credits: turn?.credits_charged,
-        turnId,
-      });
+      this.log(
+        'Entrevista terminada.',
+        phone,
+        {
+          interviewId,
+          status:
+            interviewStatus,
+          credits:
+            turn?.credits_charged,
+          turnId,
+        }
+      );
     }
 
     if (!bubbles.length) {
-      metrics.turnsTotal.inc({ status: 'success' });
+      this._metricIncrement(
+        'turnsTotal',
+        { status: 'success' }
+      );
 
-      return { handled: true, finished, status: interviewStatus };
+      return {
+        handled: true,
+        finished,
+        status:
+          interviewStatus,
+      };
     }
 
-    // -------------------------------------------------------------------------
-    // WhatsApp
-    // -------------------------------------------------------------------------
-
-    const delivery = await this._sendBubblesWithResult(
-      phone,
-      bubbles
-    );
+    const delivery =
+      await this._sendBubblesWithResult(
+        phone,
+        bubbles
+      );
 
     if (delivery.ok) {
-      metrics.turnsTotal.inc({ status: 'success' });
+      this._metricIncrement(
+        'turnsTotal',
+        { status: 'success' }
+      );
 
-      return { handled: true, finished, status: interviewStatus };
+      return {
+        handled: true,
+        finished,
+        status:
+          interviewStatus,
+      };
     }
 
-    const queued = await this._enqueuePendingDelivery({
-      phone,
-      bubbles: delivery.remaining,
-      interviewId,
-      turnId,
-      finished,
-      interviewStatus,
-    });
+    const queued =
+      await this._enqueuePendingDelivery({
+        phone,
+        bubbles:
+          delivery.remaining,
+        interviewId,
+        turnId,
+        finished,
+        interviewStatus,
+      });
 
     if (queued !== 1) {
-      metrics.errorsTotal.inc({ subsystem: 'redis' });
-      await this._safeSendFallback(phone);
+      this._metricIncrement(
+        'errorsTotal',
+        { subsystem: 'redis' }
+      );
+
+      await this._safeSendFallback(
+        phone
+      );
     }
 
-    this.logWarn('Entrega WhatsApp em fila.', phone, {
-      interviewId,
-      turnId,
-      queued: queued === 1,
-    });
+    this.logWarn(
+      'Entrega WhatsApp em fila.',
+      phone,
+      {
+        interviewId,
+        turnId,
+        queued:
+          queued === 1,
+      }
+    );
 
     return {
       handled: true,
-      queued: queued === 1,
+      queued:
+        queued === 1,
       finished,
-      status: interviewStatus,
+      status:
+        interviewStatus,
       reason:
         queued === 1
           ? 'whatsapp_delivery_queued'
@@ -1028,26 +1480,34 @@ class InterviewService {
   // ÓRFÃS
   // ===========================================================================
 
-  // [FIX-1] helper central para reportar mensagens sem entrevista.
-  async _reportOrphan({ phone, message, messageId }) {
+  async _reportOrphan({
+    phone,
+    message,
+    messageId,
+  }) {
     try {
-      if (typeof this.yane.reportUnmatchedIncoming !== 'function') {
+      if (
+        typeof this.yane
+          .reportUnmatchedIncoming !==
+        'function'
+      ) {
         return;
       }
 
-      await this.yane.reportUnmatchedIncoming({
-        phone,
-        message,
-        messageId,
-      });
+      await this.yane
+        .reportUnmatchedIncoming({
+          phone,
+          message,
+          messageId,
+        });
     } catch (error) {
-      // Best-effort.
       this.logDebug(
         'Falha ao reportar mensagem órfã.',
         phone,
         {
           msgId: messageId,
-          error: errorMessage(error),
+          error:
+            errorMessage(error),
         }
       );
     }
@@ -1057,37 +1517,90 @@ class InterviewService {
   // FILA
   // ===========================================================================
 
+  _isRedisAvailable() {
+    if (
+      typeof this.redis.isAvailable !==
+      'function'
+    ) {
+      return true;
+    }
+
+    return Boolean(
+      this.redis.isAvailable()
+    );
+  }
+
+  _getQueueKeys(phone) {
+    return {
+      queueKey:
+        this.redis.key(
+          CONFIG.pendingTurnKeyPrefix,
+          phone
+        ),
+
+      phonesKey:
+        this.redis.key(
+          CONFIG.pendingPhonesKey
+        ),
+
+      deadKey:
+        this.redis.key(
+          CONFIG.deadLetterKey
+        ),
+    };
+  }
+
   async _queueIncomingTurn({
     phone,
     message,
     messageId,
+    isButton = false,
     turnId = randomUUID(),
     interviewId = null,
     reason = 'unknown',
   }) {
-    let resolvedInterviewId = interviewId;
+    const resolvedInterviewId =
+      interviewId ||
+      (
+        await this.resolveInterviewId(
+          phone
+        )
+      );
 
-    if (!resolvedInterviewId) {
-      resolvedInterviewId = await this.resolveInterviewId(phone);
-    }
-
-    return this._enqueuePendingItem(phone, {
-      kind: 'turn',
-      schemaVersion: QUEUE_SCHEMA_VERSION,
-
+    return this._enqueuePendingItem(
       phone,
-      message,
-      messageId: messageId || null,
-      interviewId: resolvedInterviewId || null,
-      turnId,
+      {
+        kind: 'turn',
+        schemaVersion:
+          CONFIG.queueSchemaVersion,
 
-      attempts: 0,
-      lookupAttempts: 0,
+        phone,
+        message,
+        messageId:
+          messageId || null,
 
-      enqueuedAt: Date.now(),
-      lastError: null,
-      queueReason: reason,
-    });
+        isButton:
+          Boolean(isButton),
+
+        interviewId:
+          resolvedInterviewId ||
+          null,
+
+        turnId,
+
+        attempts: 0,
+        lookupAttempts: 0,
+
+        enqueuedAt:
+          Date.now(),
+
+        lastError:
+          null,
+
+        queueReason:
+          reason,
+      }
+    );
   }
 
   async _enqueuePendingDelivery({
@@ -1096,127 +1609,204 @@ class InterviewService {
     interviewId,
     turnId,
     finished = false,
-    interviewStatus = 'in_progress',
+    interviewStatus =
+      'in_progress',
   }) {
-    const cleanBubbles = this._extractBubbles(bubbles);
+    const cleanBubbles =
+      this._extractBubbles(
+        bubbles
+      );
 
     if (!cleanBubbles.length) {
       return 1;
     }
 
-    return this._enqueuePendingItem(phone, {
-      kind: 'delivery',
-      schemaVersion: QUEUE_SCHEMA_VERSION,
-
+    return this._enqueuePendingItem(
       phone,
-      bubbles: cleanBubbles,
-      interviewId: interviewId || null,
-      turnId: turnId || randomUUID(),
+      {
+        kind: 'delivery',
+        schemaVersion:
+          CONFIG.queueSchemaVersion,
 
-      finished: Boolean(finished),
-      interviewStatus,
+        phone,
+        bubbles:
+          cleanBubbles,
 
-      attempts: 0,
-      enqueuedAt: Date.now(),
-      lastError: null,
-    });
+        interviewId:
+          interviewId || null,
+
+        turnId:
+          turnId || randomUUID(),
+
+        finished:
+          Boolean(finished),
+
+        interviewStatus,
+
+        attempts: 0,
+
+        enqueuedAt:
+          Date.now(),
+
+        lastError:
+          null,
+      }
+    );
   }
 
-  async _enqueuePendingItem(phone, payload) {
-    const queueKey = this.redis.key(
-      PENDING_TURN_KEY_PREFIX,
-      phone
-    );
-
-    const phonesKey = this.redis.key(PENDING_PHONES_KEY);
+  async _enqueuePendingItem(
+    phone,
+    payload
+  ) {
+    const {
+      queueKey,
+      phonesKey,
+    } =
+      this._getQueueKeys(phone);
 
     try {
       if (
-        typeof this.redis.enqueuePendingItem !== 'function'
+        typeof this.redis
+          .enqueuePendingItem !==
+        'function'
       ) {
-        throw new Error('enqueuePendingItem_unavailable');
+        throw new Error(
+          'enqueuePendingItem_unavailable'
+        );
       }
 
-      const result = await this.redis.enqueuePendingItem({
-        queueKey,
-        phonesKey,
-        phone,
-        payload: JSON.stringify(payload),
-        score: Date.now(),
-        maxItems: MAX_PENDING_PER_PHONE,
-      });
+      const result =
+        await this.redis.enqueuePendingItem({
+          queueKey,
+          phonesKey,
+          phone,
+          payload:
+            JSON.stringify(payload),
+          score:
+            Date.now(),
+          maxItems:
+            CONFIG.maxPendingPerPhone,
+        });
 
-      // [FIX-5] fila cheia: avisar o candidato em vez de descartar
-      // silenciosamente.
+      if (result === 1) {
+        this._metricIncrement(
+          'queueEnqueued',
+          {
+            kind:
+              payload?.kind ||
+              'turn',
+
+            reason:
+              payload?.queueReason ||
+              'unknown',
+          }
+        );
+      }
+
       if (result === 0) {
         this.logWarn(
           'Fila cheia — a notificar candidato.',
           phone,
           {
-            kind: payload?.kind || null,
-            turnId: payload?.turnId || null,
+            kind:
+              payload?.kind ||
+              null,
+
+            turnId:
+              payload?.turnId ||
+              null,
           }
         );
 
-        await this._sendQueueFullNotice(phone);
+        await this._sendQueueFullNotice(
+          phone
+        );
       }
 
       return result;
     } catch (error) {
-      this.logError('Falha ao enfileirar item.', error, phone, {
-        kind: payload?.kind || null,
-        turnId: payload?.turnId || null,
-      });
+      this.logError(
+        'Falha ao enfileirar item.',
+        error,
+        phone,
+        {
+          kind:
+            payload?.kind ||
+            null,
+
+          turnId:
+            payload?.turnId ||
+            null,
+        }
+      );
 
       return 0;
     }
   }
 
-  // [FIX-5] notificação explícita quando a fila está cheia.
   async _sendQueueFullNotice(phone) {
     try {
-      const client = this._getWhatsAppService();
+      const client =
+        this._getWhatsAppService();
 
-      if (!this._isWhatsAppReady(client)) {
+      if (
+        !this._isWhatsAppReady(client)
+      ) {
         return;
       }
 
-      await client.sendMessage(phone, QUEUE_FULL_MESSAGE);
+      const normalizedPhone =
+        normalizePhone(phone);
+
+      if (!normalizedPhone) {
+        return;
+      }
+
+      await client.sendMessage(
+        normalizedPhone,
+        CONFIG.queueFullMessage
+      );
     } catch (error) {
       this.logDebug(
         'Falha ao enviar aviso de fila cheia.',
         phone,
-        { error: errorMessage(error) }
+        {
+          error:
+            errorMessage(error),
+        }
       );
     }
   }
 
   async _peekPendingItem(phone) {
-    const queueKey = this.redis.key(
-      PENDING_TURN_KEY_PREFIX,
-      phone
-    );
+    const { queueKey } =
+      this._getQueueKeys(phone);
 
-    return this.redis.lindex(queueKey, -1);
+    return this.redis.lindex(
+      queueKey,
+      -1
+    );
   }
 
   async _dequeuePendingItem(phone) {
-    const queueKey = this.redis.key(
-      PENDING_TURN_KEY_PREFIX,
-      phone
-    );
+    const { queueKey } =
+      this._getQueueKeys(phone);
 
-    return this.redis.rpop(queueKey);
+    return this.redis.rpop(
+      queueKey
+    );
   }
 
   async _pendingCount(phone) {
-    const queueKey = this.redis.key(
-      PENDING_TURN_KEY_PREFIX,
-      phone
-    );
+    const { queueKey } =
+      this._getQueueKeys(phone);
 
     try {
-      return Number(await this.redis.llen(queueKey)) || 0;
+      return Number(
+        await this.redis.llen(
+          queueKey
+        )
+      ) || 0;
     } catch (error) {
       this.logError(
         'Falha ao obter profundidade da fila.',
@@ -1233,69 +1823,180 @@ class InterviewService {
   // ===========================================================================
 
   _startWorker() {
-    if (this._workerTimer || this._closing) {
+    if (
+      this._workerTimer ||
+      this._closing
+    ) {
       return;
     }
 
-    this._workerTimer = setInterval(
-      () => this._triggerWorker(),
-      WORKER_INTERVAL_MS
+    this._workerTimer =
+      setInterval(
+        () =>
+          this._triggerWorker(),
+        CONFIG.workerIntervalMs
+      );
+
+    this._unrefTimer(
+      this._workerTimer
     );
 
-    if (typeof this._workerTimer.unref === 'function') {
-      this._workerTimer.unref();
-    }
+    this._deadLetterTimer =
+      setInterval(
+        () => {
+          void this
+            ._reportDeadLetterDepth();
+        },
+        CONFIG.deadLetterReportIntervalMs
+      );
 
-    this.log('Worker de recuperação iniciado.', null, {
-      intervalMs: WORKER_INTERVAL_MS,
-      batchSize: WORKER_BATCH_SIZE,
-      maxPerPhone: WORKER_MAX_PER_PHONE,
-    });
+    this._unrefTimer(
+      this._deadLetterTimer
+    );
+
+    void this._reportDeadLetterDepth();
+
+    this.log(
+      'Worker de recuperação iniciado.',
+      null,
+      {
+        intervalMs:
+          CONFIG.workerIntervalMs,
+
+        batchSize:
+          CONFIG.workerBatchSize,
+
+        maxPerPhone:
+          CONFIG.workerMaxPerPhone,
+      }
+    );
   }
 
   _stopWorker() {
-    if (!this._workerTimer) {
-      return;
+    if (this._workerTimer) {
+      clearInterval(
+        this._workerTimer
+      );
+
+      this._workerTimer = null;
     }
 
-    clearInterval(this._workerTimer);
-    this._workerTimer = null;
+    if (this._deadLetterTimer) {
+      clearInterval(
+        this._deadLetterTimer
+      );
 
-    this.log('Worker de recuperação parado.');
+      this._deadLetterTimer = null;
+    }
+
+    this.log(
+      'Worker de recuperação parado.'
+    );
+  }
+
+  _unrefTimer(timer) {
+    if (
+      timer &&
+      typeof timer.unref ===
+        'function'
+    ) {
+      timer.unref();
+    }
+  }
+
+  async _reportDeadLetterDepth() {
+    try {
+      if (
+        typeof this.redis.llen !==
+        'function'
+      ) {
+        return;
+      }
+
+      const deadKey =
+        this.redis.key(
+          CONFIG.deadLetterKey
+        );
+
+      const depth =
+        Number(
+          await this.redis.llen(
+            deadKey
+          )
+        ) || 0;
+
+      this._metricSet(
+        'deadLetterDepth',
+        depth
+      );
+
+      if (depth > 0) {
+        this.logWarn(
+          'Dead-letter com itens pendentes.',
+          null,
+          { depth }
+        );
+      }
+    } catch (error) {
+      this.logDebug(
+        'Falha ao reportar profundidade da dead-letter.',
+        null,
+        {
+          error:
+            errorMessage(error),
+        }
+      );
+    }
   }
 
   _triggerWorker() {
-    if (this._closing || this._workerRunning) {
+    if (
+      this._closing ||
+      this._workerRunning
+    ) {
       return;
     }
 
-    const promise = this._processPendingTurns();
+    const promise =
+      this._processPendingTurns();
 
-    this._workerPromise = promise;
+    this._workerPromise =
+      promise;
 
     promise
       .catch((error) => {
-        this.logError('Worker falhou.', error);
+        this.logError(
+          'Worker falhou.',
+          error
+        );
       })
       .finally(() => {
-        if (this._workerPromise === promise) {
-          this._workerPromise = null;
+        if (
+          this._workerPromise ===
+          promise
+        ) {
+          this._workerPromise =
+            null;
         }
       });
   }
 
   async _processPendingTurns() {
-    if (this._workerRunning || this._closing) {
-      return;
-    }
-
-    if (!this._isWhatsAppReady()) {
+    if (
+      this._workerRunning ||
+      this._closing
+    ) {
       return;
     }
 
     if (
-      typeof this.redis.isAvailable === 'function' &&
-      !this.redis.isAvailable()
+      !this._isWhatsAppReady()
+    ) {
+      return;
+    }
+
+    if (
+      !this._isRedisAvailable()
     ) {
       return;
     }
@@ -1303,32 +2004,42 @@ class InterviewService {
     this._workerRunning = true;
 
     try {
-      const phonesKey = this.redis.key(PENDING_PHONES_KEY);
+      const phonesKey =
+        this.redis.key(
+          CONFIG.pendingPhonesKey
+        );
 
-      const now = Date.now();
+      const now =
+        Date.now();
 
-      const phones = await this.redis.zrangeByScore(
-        phonesKey,
-        '-inf',
-        now,
-        0,
-        WORKER_BATCH_SIZE
+      const phones =
+        await this.redis
+          .zrangeByScore(
+            phonesKey,
+            '-inf',
+            now,
+            0,
+            CONFIG.workerBatchSize
+          );
+
+      // Profundidade agregada do lote.
+      this._metricSet(
+        'queueDepth',
+        phones.length,
+        {
+          kind: 'batch',
+        }
       );
 
-      try {
-        metrics.queueDepth?.set(phones.length);
-      } catch (_) {
-        // Best-effort.
-      }
-
       for (const phone of phones) {
-        // [FIX-6] abortar o loop de telefones se estivermos a fechar.
         if (this._closing) {
           break;
         }
 
         try {
-          await this._processPhoneQueue(phone);
+          await this._processPhoneQueue(
+            phone
+          );
         } catch (error) {
           this.logError(
             'Falha ao processar fila do telefone.',
@@ -1338,7 +2049,8 @@ class InterviewService {
         }
       }
     } finally {
-      this._workerRunning = false;
+      this._workerRunning =
+        false;
     }
   }
 
@@ -1346,53 +2058,90 @@ class InterviewService {
   // LOCK
   // ===========================================================================
 
-  _startLockRefresh(phone, token) {
-    if (typeof this.redis.refreshLock !== 'function') {
+  _startLockRefresh(
+    phone,
+    token
+  ) {
+    if (
+      typeof this.redis
+        .refreshLock !==
+      'function'
+    ) {
       return null;
     }
 
-    const timer = setInterval(() => {
-      if (this._closing) return;
+    const timer =
+      setInterval(() => {
+        if (this._closing) {
+          return;
+        }
 
-      this.redis
-        .refreshLock(phone, token, WORKER_LOCK_TTL)
-        .catch((error) => {
-          this.logWarn('Falha ao renovar lock.', phone, {
-            error: errorMessage(error),
+        this.redis
+          .refreshLock(
+            phone,
+            token,
+            CONFIG.lockTtlSeconds
+          )
+          .catch((error) => {
+            this.logWarn(
+              'Falha ao renovar lock.',
+              phone,
+              {
+                error:
+                  errorMessage(error),
+              }
+            );
           });
-        });
-    }, WORKER_LOCK_REFRESH_MS);
+      }, CONFIG.lockRefreshMs);
 
-    if (typeof timer.unref === 'function') {
-      timer.unref();
-    }
+    this._unrefTimer(timer);
 
     return timer;
   }
 
-  async _withPhoneLock(phone, fn) {
-    const token = await this.redis.acquireLock(
-      phone,
-      WORKER_LOCK_TTL
-    );
+  async _withPhoneLock(
+    phone,
+    fn
+  ) {
+    const token =
+      await this.redis.acquireLock(
+        phone,
+        CONFIG.lockTtlSeconds
+      );
 
-    if (!token) return null;
+    if (!token) {
+      return null;
+    }
 
-    const refreshTimer = this._startLockRefresh(phone, token);
+    const refreshTimer =
+      this._startLockRefresh(
+        phone,
+        token
+      );
 
     try {
       return await fn();
     } finally {
       if (refreshTimer) {
-        clearInterval(refreshTimer);
+        clearInterval(
+          refreshTimer
+        );
       }
 
       try {
-        await this.redis.releaseLock(phone, token);
+        await this.redis.releaseLock(
+          phone,
+          token
+        );
       } catch (error) {
-        this.logWarn('Falha ao libertar lock.', phone, {
-          error: errorMessage(error),
-        });
+        this.logWarn(
+          'Falha ao libertar lock.',
+          phone,
+          {
+            error:
+              errorMessage(error),
+          }
+        );
       }
     }
   }
@@ -1402,30 +2151,47 @@ class InterviewService {
   // ===========================================================================
 
   async _processPhoneQueue(phone) {
-    const token = await this.redis.acquireLock(
-      phone,
-      WORKER_LOCK_TTL
-    );
+    const token =
+      await this.redis.acquireLock(
+        phone,
+        CONFIG.lockTtlSeconds
+      );
 
-    if (!token) return;
+    if (!token) {
+      return;
+    }
 
-    const refreshTimer = this._startLockRefresh(phone, token);
+    const refreshTimer =
+      this._startLockRefresh(
+        phone,
+        token
+      );
 
     try {
       let processed = 0;
 
+      // Iteração sequencial intencional.
+      // O await dentro do loop preserva a ordem FIFO por telefone.
+      // Ver nota no header do ficheiro.
       while (
-        processed < WORKER_MAX_PER_PHONE &&
+        processed <
+          CONFIG.workerMaxPerPhone &&
         !this._closing
       ) {
-        const raw = await this._peekPendingItem(phone);
+        const raw =
+          await this._peekPendingItem(
+            phone
+          );
 
-        if (!raw) break;
+        if (!raw) {
+          break;
+        }
 
         let payload;
 
         try {
-          payload = JSON.parse(raw);
+          payload =
+            JSON.parse(raw);
         } catch (error) {
           this.logError(
             'Item inválido na fila.',
@@ -1433,67 +2199,112 @@ class InterviewService {
             phone
           );
 
-          const moved = await this._deadLetterPendingItem(phone, {
-            reason: 'invalid_json',
-            raw,
-          });
+          const moved =
+            await this
+              ._deadLetterPendingItem(
+                phone,
+                {
+                  reason:
+                    'invalid_json',
+                  raw,
+                }
+              );
 
           if (moved) {
             processed += 1;
             continue;
           }
 
-          await this._quarantinePendingItem(phone, {
-            kind: 'unknown',
-            raw,
-            attempts: PENDING_MAX_ATTEMPTS,
-          });
+          await this
+            ._quarantinePendingItem(
+              phone,
+              {
+                kind: 'unknown',
+                raw,
+                attempts:
+                  CONFIG.pendingMaxAttempts,
+              }
+            );
 
           break;
         }
 
-        payload = this._normalizePendingPayload(phone, payload);
+        payload =
+          this._normalizePendingPayload(
+            phone,
+            payload
+          );
 
-        const result = await this._processPendingItem(phone, payload);
+        const result =
+          await this._processPendingItem(
+            phone,
+            payload
+          );
 
         if (result.action === 'ack') {
-          await this._dequeuePendingItem(phone);
+          await this._dequeuePendingItem(
+            phone
+          );
+
           processed += 1;
           continue;
         }
 
-        if (result.action === 'dead_letter') {
-          const moved = await this._deadLetterPendingItem(phone, {
-            reason: result.reason || 'terminal_failure',
-            payload: result.payload || payload,
-          });
+        if (
+          result.action ===
+          'dead_letter'
+        ) {
+          const moved =
+            await this
+              ._deadLetterPendingItem(
+                phone,
+                {
+                  reason:
+                    result.reason ||
+                    'terminal_failure',
+
+                  payload:
+                    result.payload ||
+                    payload,
+                }
+              );
 
           if (moved) {
             processed += 1;
             continue;
           }
 
-          await this._quarantinePendingItem(
-            phone,
-            result.payload || payload
-          );
+          await this
+            ._quarantinePendingItem(
+              phone,
+              result.payload ||
+                payload
+            );
 
           break;
         }
 
         if (result.action === 'retry') {
-          const retryResult = await this._reschedulePendingItem(
-            phone,
-            result.payload || payload,
-            result.retryAfterMs || 0,
-            result.retryable !== false
-          );
+          const retryResult =
+            await this
+              ._reschedulePendingItem(
+                phone,
+                result.payload ||
+                  payload,
+
+                result.retryAfterMs ||
+                  0,
+
+                result.retryable !==
+                  false
+              );
 
           if (retryResult.removed) {
             processed += 1;
           }
 
-          // Preservar FIFO.
+          // O item continua a ser o topo lógico da fila:
+          // não ultrapassar uma entrega pendente.
           break;
         }
 
@@ -1501,15 +2312,26 @@ class InterviewService {
           'Resultado desconhecido do processamento; item será reagendado.',
           phone,
           {
-            kind: payload.kind || 'unknown',
-            turnId: payload.turnId || null,
+            kind:
+              payload.kind ||
+              'unknown',
+
+            turnId:
+              payload.turnId ||
+              null,
           }
         );
 
-        const retryResult = await this._reschedulePendingItem(
-          phone,
-          { ...payload, lastError: 'unknown_processing_result' }
-        );
+        const retryResult =
+          await this
+            ._reschedulePendingItem(
+              phone,
+              {
+                ...payload,
+                lastError:
+                  'unknown_processing_result',
+              }
+            );
 
         if (retryResult.removed) {
           processed += 1;
@@ -1518,35 +2340,58 @@ class InterviewService {
         break;
       }
 
-      const remaining = await this._pendingCount(phone);
+      const remaining =
+        await this._pendingCount(
+          phone
+        );
 
       if (remaining === 0) {
-        const phonesKey = this.redis.key(PENDING_PHONES_KEY);
+        const { phonesKey } =
+          this._getQueueKeys(phone);
 
-        await this.redis.zrem(phonesKey, phone);
+        await this.redis.zrem(
+          phonesKey,
+          phone
+        );
       }
     } finally {
       if (refreshTimer) {
-        clearInterval(refreshTimer);
+        clearInterval(
+          refreshTimer
+        );
       }
 
       try {
-        await this.redis.releaseLock(phone, token);
+        await this.redis.releaseLock(
+          phone,
+          token
+        );
       } catch (error) {
         this.logWarn(
           'Falha ao libertar lock do worker.',
           phone,
-          { error: errorMessage(error) }
+          {
+            error:
+              errorMessage(error),
+          }
         );
       }
     }
   }
 
-  _normalizePendingPayload(phone, payload) {
-    if (!payload || typeof payload !== 'object') {
+  _normalizePendingPayload(
+    phone,
+    payload
+  ) {
+    if (
+      !payload ||
+      typeof payload !==
+        'object'
+    ) {
       return {
         kind: 'turn',
-        schemaVersion: QUEUE_SCHEMA_VERSION,
+        schemaVersion:
+          CONFIG.queueSchemaVersion,
         phone,
         attempts: 0,
         lookupAttempts: 0,
@@ -1555,145 +2400,274 @@ class InterviewService {
 
     return {
       schemaVersion:
-        payload.schemaVersion || QUEUE_SCHEMA_VERSION,
+        payload.schemaVersion ||
+        CONFIG.queueSchemaVersion,
 
-      kind: payload.kind || 'turn',
+      kind:
+        payload.kind ||
+        'turn',
 
-      phone: normalizePhone(payload.phone) || phone,
+      phone:
+        normalizePhone(
+          payload.phone
+        ) || phone,
 
-      message: payload.message
-        ? String(payload.message)
-        : undefined,
+      message:
+        payload.message
+          ? String(
+              payload.message
+            )
+          : undefined,
 
-      messageId: payload.messageId || null,
+      messageId:
+        payload.messageId ||
+        null,
 
-      interviewId: payload.interviewId || null,
+      isButton:
+        Boolean(payload.isButton),
 
-      turnId: payload.turnId || randomUUID(),
+      interviewId:
+        payload.interviewId ||
+        null,
 
-      bubbles: this._extractBubbles(payload.bubbles),
+      turnId:
+        payload.turnId ||
+        randomUUID(),
 
-      finished: Boolean(payload.finished),
+      bubbles:
+        this._extractBubbles(
+          payload.bubbles
+        ),
 
-      interviewStatus: payload.interviewStatus || 'in_progress',
+      finished:
+        Boolean(payload.finished),
 
-      attempts: Math.max(0, Number(payload.attempts) || 0),
+      interviewStatus:
+        payload.interviewStatus ||
+        'in_progress',
 
-      lookupAttempts: Math.max(
-        0,
-        Number(payload.lookupAttempts) || 0
-      ),
+      attempts:
+        Math.max(
+          0,
+          Number(
+            payload.attempts
+          ) || 0
+        ),
 
-      enqueuedAt: Number(payload.enqueuedAt) || Date.now(),
+      lookupAttempts:
+        Math.max(
+          0,
+          Number(
+            payload.lookupAttempts
+          ) || 0
+        ),
 
-      lastError: payload.lastError || null,
+      enqueuedAt:
+        Number(
+          payload.enqueuedAt
+        ) || Date.now(),
 
-      queueReason: payload.queueReason || null,
+      lastError:
+        payload.lastError ||
+        null,
+
+      queueReason:
+        payload.queueReason ||
+        null,
     };
   }
 
   // ===========================================================================
-  // PROCESSAMENTO DE ITEM
+  // PROCESSAMENTO DE ITEM PENDENTE
   // ===========================================================================
 
-  async _processPendingItem(phone, payload) {
-    if (payload.kind === 'delivery') {
-      return this._processPendingDelivery(phone, payload);
+  async _processPendingItem(
+    phone,
+    payload
+  ) {
+    if (
+      payload.kind ===
+      'delivery'
+    ) {
+      return this
+        ._processPendingDelivery(
+          phone,
+          payload
+        );
     }
 
-    return this._processPendingTurn(phone, payload);
+    return this._processPendingTurn(
+      phone,
+      payload
+    );
   }
 
   // ===========================================================================
   // TURNO PENDENTE → BACKEND
   // ===========================================================================
 
-  async _processPendingTurn(phone, payload) {
-    let { interviewId, lookupAttempts = 0 } = payload;
+  async _processPendingTurn(
+    phone,
+    payload
+  ) {
+    let {
+      interviewId,
+      lookupAttempts = 0,
+    } = payload;
 
-    const { message, messageId, turnId } = payload;
+    const {
+      message,
+      messageId,
+      turnId,
+      isButton = false,
+    } = payload;
 
-    if (payload.attempts >= PENDING_MAX_ATTEMPTS) {
+    if (
+      payload.attempts >=
+      CONFIG.pendingMaxAttempts
+    ) {
       return {
-        action: 'dead_letter',
-        reason: 'max_attempts_reached',
+        action:
+          'dead_letter',
+
+        reason:
+          'max_attempts_reached',
+
         payload,
       };
     }
 
     if (!interviewId) {
-      interviewId = await this.resolveInterviewId(phone);
+      interviewId =
+        await this.resolveInterviewId(
+          phone
+        );
 
-      if (!interviewId && lookupAttempts < MAX_LOOKUP_ATTEMPTS) {
+      if (
+        !interviewId &&
+        lookupAttempts <
+          CONFIG.maxLookupAttempts
+      ) {
         try {
           const active =
-            await this.yane.findActiveInterviewByPhone(phone);
+            await this.yane
+              .findActiveInterviewByPhone(
+                phone
+              );
 
           if (active?.id) {
-            interviewId = active.id;
+            interviewId =
+              active.id;
 
-            await this.rememberInterview(phone, interviewId);
+            await this
+              .rememberInterview(
+                phone,
+                interviewId
+              );
           }
         } catch (error) {
           lookupAttempts += 1;
 
-          metrics.errorsTotal.inc({ subsystem: 'backend' });
+          this._metricIncrement(
+            'errorsTotal',
+            {
+              subsystem:
+                'backend',
+            }
+          );
 
-          this.logWarn('Lookup falhou em retry.', phone, {
-            turnId,
-            lookupAttempts,
-            maxLookups: MAX_LOOKUP_ATTEMPTS,
-            error: errorMessage(error),
-          });
+          this.logWarn(
+            'Lookup falhou em retry.',
+            phone,
+            {
+              turnId,
+              lookupAttempts,
+              maxLookups:
+                CONFIG.maxLookupAttempts,
 
-          if (lookupAttempts >= MAX_LOOKUP_ATTEMPTS) {
+              error:
+                errorMessage(error),
+            }
+          );
+
+          if (
+            lookupAttempts >=
+            CONFIG.maxLookupAttempts
+          ) {
             return {
-              action: 'dead_letter',
-              reason: 'lookup_exhausted',
+              action:
+                'dead_letter',
+
+              reason:
+                'lookup_exhausted',
+
               payload: {
                 ...payload,
                 lookupAttempts,
-                lastError: errorMessage(error),
+                lastError:
+                  errorMessage(error),
               },
             };
           }
 
           return {
             action: 'retry',
+
             payload: {
               ...payload,
               lookupAttempts,
-              lastError: errorMessage(error),
+              lastError:
+                errorMessage(error),
             },
-            retryable: isRetryableError(error),
-            retryAfterMs: getRetryAfterMs(error),
+
+            retryable:
+              isRetryableError(
+                error
+              ),
+
+            retryAfterMs:
+              getRetryAfterMs(
+                error
+              ),
           };
         }
       }
 
       if (!interviewId) {
-        if (lookupAttempts >= MAX_LOOKUP_ATTEMPTS) {
+        if (
+          lookupAttempts >=
+          CONFIG.maxLookupAttempts
+        ) {
           return {
-            action: 'dead_letter',
-            reason: 'no_interview_resolvable',
-            payload: { ...payload, lookupAttempts },
+            action:
+              'dead_letter',
+
+            reason:
+              'no_interview_resolvable',
+
+            payload: {
+              ...payload,
+              lookupAttempts,
+            },
           };
         }
 
-        // [FIX-1] reportar órfã antes de descartar.
         this.logWarn(
           'Turno recuperado sem entrevista resolvível — reportando órfã.',
           phone,
           { turnId }
         );
 
-        await this._reportOrphan({
-          phone,
-          message,
-          messageId,
-        });
+        await this
+          ._reportOrphan({
+            phone,
+            message,
+            messageId,
+          });
 
-        return { action: 'ack' };
+        return {
+          action: 'ack',
+        };
       }
 
       payload = {
@@ -1706,127 +2680,222 @@ class InterviewService {
     let turn;
 
     try {
-      turn = await metrics.time(
-        metrics.turnDuration,
-        { endpoint: 'turn-recovered' },
-        () =>
-          this.yane.sendInterviewTurn({
-            interviewId,
-            phone,
-            message,
-            turnId,
-            messageId,
-          })
-      );
+      turn =
+        await metrics.time(
+          metrics.turnDuration,
+          {
+            endpoint:
+              'turn-recovered',
+          },
+          () =>
+            this.yane
+              .sendInterviewTurn({
+                interviewId,
+                phone,
+                message,
+                turnId,
+                messageId,
+                isButton,
+              })
+        );
 
       if (!turn) {
-        throw new Error('backend_empty_response');
+        throw new Error(
+          'backend_empty_response'
+        );
       }
     } catch (error) {
-      metrics.errorsTotal.inc({ subsystem: 'backend' });
+      this._metricIncrement(
+        'errorsTotal',
+        {
+          subsystem:
+            'backend',
+        }
+      );
 
-      // [FIX-4] erros definitivos vão logo para dead-letter.
-      if (!isRetryableError(error)) {
+      if (
+        !isRetryableError(
+          error
+        )
+      ) {
         this.logWarn(
           'Erro definitivo do backend — dead-letter directo.',
           phone,
           {
             interviewId,
             turnId,
-            code: error?.code || null,
-            status: error?.status || null,
+            code:
+              error?.code ||
+              null,
+
+            status:
+              error?.status ||
+              null,
           }
         );
 
         return {
-          action: 'dead_letter',
-          reason: 'backend_terminal_error',
+          action:
+            'dead_letter',
+
+          reason:
+            'backend_terminal_error',
+
           payload: {
             ...payload,
             interviewId,
-            lastError: errorMessage(error),
+            lastError:
+              errorMessage(
+                error
+              ),
           },
         };
       }
 
-      this.logWarn('Recuperação do turno falhou.', phone, {
-        interviewId,
-        turnId,
-        attempts: payload.attempts + 1,
-        error: errorMessage(error),
-        retryAfterMs: getRetryAfterMs(error),
-      });
+      this.logWarn(
+        'Recuperação do turno falhou.',
+        phone,
+        {
+          interviewId,
+          turnId,
+          attempts:
+            payload.attempts +
+            1,
+
+          error:
+            errorMessage(error),
+
+          retryAfterMs:
+            getRetryAfterMs(
+              error
+            ),
+        }
+      );
 
       return {
         action: 'retry',
+
         payload: {
           ...payload,
           interviewId,
-          lastError: errorMessage(error),
+          lastError:
+            errorMessage(error),
         },
+
         retryable: true,
-        retryAfterMs: getRetryAfterMs(error),
+
+        retryAfterMs:
+          getRetryAfterMs(
+            error
+          ),
       };
     }
 
-    metrics.turnsTotal.inc({ status: 'recovered' });
+    this._metricIncrement(
+      'turnsTotal',
+      {
+        status: 'recovered',
+      }
+    );
 
-    const bubbles = this._extractBubbles(turn.bubbles);
-    const finished = Boolean(turn.finished);
-    const interviewStatus = turn.interview_status || 'in_progress';
+    const bubbles =
+      this._extractBubbles(
+        turn.bubbles
+      );
+
+    const finished =
+      Boolean(turn.finished);
+
+    const interviewStatus =
+      turn.interview_status ||
+      'in_progress';
 
     if (finished) {
-      await this.forgetInterview(phone);
+      await this.forgetInterview(
+        phone
+      );
 
-      metrics.interviewsFinished.inc({ status: interviewStatus });
+      this._metricIncrement(
+        'interviewsFinished',
+        {
+          status:
+            interviewStatus,
+        }
+      );
 
-      this.log('Entrevista terminada (recuperada).', phone, {
-        interviewId,
-        status: interviewStatus,
-        credits: turn.credits_charged,
-        turnId,
-      });
+      this.log(
+        'Entrevista terminada (recuperada).',
+        phone,
+        {
+          interviewId,
+          status:
+            interviewStatus,
+
+          credits:
+            turn.credits_charged,
+
+          turnId,
+        }
+      );
     }
 
     if (!bubbles.length) {
-      return { action: 'ack' };
+      return {
+        action: 'ack',
+      };
     }
 
-    const delivery = await this._sendBubblesWithResult(
-      phone,
-      bubbles
-    );
+    const delivery =
+      await this
+        ._sendBubblesWithResult(
+          phone,
+          bubbles
+        );
 
     if (delivery.ok) {
-      this.log('Turno recuperado e entregue.', phone, {
-        interviewId,
-        turnId,
-      });
+      this.log(
+        'Turno recuperado e entregue.',
+        phone,
+        {
+          interviewId,
+          turnId,
+        }
+      );
 
-      return { action: 'ack' };
+      return {
+        action: 'ack',
+      };
     }
 
     return {
       action: 'retry',
+
       payload: {
-        kind: 'delivery',
-        schemaVersion: QUEUE_SCHEMA_VERSION,
+        kind:
+          'delivery',
+
+        schemaVersion:
+          CONFIG.queueSchemaVersion,
 
         phone,
 
-        bubbles: delivery.remaining,
+        bubbles:
+          delivery.remaining,
 
         interviewId,
         turnId,
-
         finished,
         interviewStatus,
 
         attempts: 0,
-        enqueuedAt: Date.now(),
 
-        lastError: 'whatsapp_delivery_failed',
+        enqueuedAt:
+          Date.now(),
+
+        lastError:
+          'whatsapp_delivery_failed',
       },
+
       retryable: true,
     };
   }
@@ -1835,33 +2904,56 @@ class InterviewService {
   // ENTREGA PENDENTE → WHATSAPP
   // ===========================================================================
 
-  async _processPendingDelivery(phone, payload) {
-    const bubbles = this._extractBubbles(payload.bubbles);
+  async _processPendingDelivery(
+    phone,
+    payload
+  ) {
+    const bubbles =
+      this._extractBubbles(
+        payload.bubbles
+      );
 
     if (!bubbles.length) {
-      return { action: 'ack' };
+      return {
+        action: 'ack',
+      };
     }
 
-    const delivery = await this._sendBubblesWithResult(
-      phone,
-      bubbles
-    );
+    const delivery =
+      await this
+        ._sendBubblesWithResult(
+          phone,
+          bubbles
+        );
 
     if (delivery.ok) {
-      this.log('Resposta pendente entregue.', phone, {
-        turnId: payload.turnId,
-      });
+      this.log(
+        'Resposta pendente entregue.',
+        phone,
+        {
+          turnId:
+            payload.turnId,
+        }
+      );
 
-      return { action: 'ack' };
+      return {
+        action: 'ack',
+      };
     }
 
     return {
       action: 'retry',
+
       payload: {
         ...payload,
-        bubbles: delivery.remaining,
-        lastError: 'whatsapp_delivery_failed',
+
+        bubbles:
+          delivery.remaining,
+
+        lastError:
+          'whatsapp_delivery_failed',
       },
+
       retryable: true,
     };
   }
@@ -1870,196 +2962,384 @@ class InterviewService {
   // RETRY / BACKOFF
   // ===========================================================================
 
-  // [FIX-4] assinatura estendida: retryAfterMs, retryable.
   async _reschedulePendingItem(
     phone,
     payload,
     retryAfterMs = 0,
     retryable = true
   ) {
-    const attempts = Number(payload.attempts) + 1;
+    const attempts =
+      Number(payload.attempts) + 1;
 
-    const updated = { ...payload, attempts };
+    const updated = {
+      ...payload,
+      attempts,
+    };
 
-    // [FIX-4] erro definitivo: dead-letter imediato.
     if (!retryable) {
-      const moved = await this._deadLetterPendingItem(phone, {
-        reason: 'non_retryable_error',
-        payload: updated,
-      });
+      const moved =
+        await this
+          ._deadLetterPendingItem(
+            phone,
+            {
+              reason:
+                'non_retryable_error',
+
+              payload:
+                updated,
+            }
+          );
 
       if (moved) {
-        return { removed: true };
+        return {
+          removed: true,
+        };
       }
 
-      await this._quarantinePendingItem(phone, updated);
-      return { removed: false };
+      await this
+        ._quarantinePendingItem(
+          phone,
+          updated
+        );
+
+      return {
+        removed: false,
+      };
     }
 
-    if (attempts >= PENDING_MAX_ATTEMPTS) {
-      const moved = await this._deadLetterPendingItem(phone, {
-        reason: 'max_attempts_reached',
-        payload: updated,
-      });
+    if (
+      attempts >=
+      CONFIG.pendingMaxAttempts
+    ) {
+      const moved =
+        await this
+          ._deadLetterPendingItem(
+            phone,
+            {
+              reason:
+                'max_attempts_reached',
+
+              payload:
+                updated,
+            }
+          );
 
       if (moved) {
-        return { removed: true };
+        return {
+          removed: true,
+        };
       }
 
-      await this._quarantinePendingItem(phone, updated);
-      return { removed: false };
+      await this
+        ._quarantinePendingItem(
+          phone,
+          updated
+        );
+
+      return {
+        removed: false,
+      };
     }
 
     const exponential =
-      PENDING_BACKOFF_BASE_MS *
-      Math.pow(2, attempts - 1);
+      CONFIG.backoffBaseMs *
+      Math.pow(
+        2,
+        attempts - 1
+      );
 
-    const jitter = 0.8 + Math.random() * 0.4;
+    const jitter =
+      0.8 +
+      Math.random() * 0.4;
 
-    const computedBackoff = Math.min(
-      exponential * jitter,
-      PENDING_BACKOFF_MAX_MS
-    );
+    const computedBackoff =
+      Math.min(
+        exponential * jitter,
+        CONFIG.backoffMaxMs
+      );
 
-    // [FIX-4] quando o servidor indicou retryAfterMs, respeitar
-    // (com um mínimo razoável para não bloquear a fila).
-    const backoff = Number.isFinite(retryAfterMs) && retryAfterMs > 0
-      ? Math.min(Math.max(retryAfterMs, 1_000), PENDING_BACKOFF_MAX_MS)
-      : computedBackoff;
+    const backoff =
+      Number.isFinite(
+        retryAfterMs
+      ) &&
+      retryAfterMs > 0
+        ? Math.min(
+            Math.max(
+              retryAfterMs,
+              1_000
+            ),
+            CONFIG.backoffMaxMs
+          )
+        : computedBackoff;
 
-    const scheduledAt = Date.now() + Math.round(backoff);
+    const scheduledAt =
+      Date.now() +
+      Math.round(backoff);
 
-    const queueKey = this.redis.key(
-      PENDING_TURN_KEY_PREFIX,
-      phone
-    );
-
-    const phonesKey = this.redis.key(PENDING_PHONES_KEY);
+    const {
+      queueKey,
+      phonesKey,
+    } =
+      this._getQueueKeys(phone);
 
     try {
       if (
-        typeof this.redis.reschedulePendingItem !== 'function'
+        typeof this.redis
+          .reschedulePendingItem !==
+        'function'
       ) {
-        throw new Error('reschedulePendingItem_unavailable');
+        throw new Error(
+          'reschedulePendingItem_unavailable'
+        );
       }
 
       const updatedOk =
-        await this.redis.reschedulePendingItem({
-          queueKey,
-          phonesKey,
-          phone,
-          payload: JSON.stringify(updated),
-          score: scheduledAt,
-        });
+        await this
+          .redis
+          .reschedulePendingItem({
+            queueKey,
+            phonesKey,
+            phone,
+            payload:
+              JSON.stringify(
+                updated
+              ),
+            score:
+              scheduledAt,
+          });
 
       if (!updatedOk) {
-        throw new Error('reschedule_pending_item_failed');
+        throw new Error(
+          'reschedule_pending_item_failed'
+        );
       }
 
-      this.log('Item reagendado.', phone, {
-        kind: updated.kind || 'turn',
-        attempts,
-        backoffSeconds: Math.round(backoff / 1000),
-        turnId: updated.turnId || null,
-        source: retryAfterMs > 0 ? 'retry_after' : 'backoff',
-      });
+      this._metricIncrement(
+        'queueRequeued',
+        {
+          kind:
+            updated.kind ||
+            'turn',
+        }
+      );
 
-      return { removed: false };
+      this.log(
+        'Item reagendado.',
+        phone,
+        {
+          kind:
+            updated.kind ||
+            'turn',
+
+          attempts,
+
+          backoffSeconds:
+            Math.round(
+              backoff / 1000
+            ),
+
+          turnId:
+            updated.turnId ||
+            null,
+
+          source:
+            retryAfterMs > 0
+              ? 'retry_after'
+              : 'backoff',
+        }
+      );
+
+      return {
+        removed: false,
+      };
     } catch (error) {
       this.logError(
         'Falha ao reagendar item.',
         error,
         phone,
-        { turnId: payload.turnId || null }
+        {
+          turnId:
+            payload.turnId ||
+            null,
+        }
       );
 
-      return { removed: false };
+      return {
+        removed: false,
+      };
     }
   }
 
-  async _quarantinePendingItem(phone, payload) {
+  async _quarantinePendingItem(
+    phone,
+    payload
+  ) {
     try {
       const updated = {
         ...payload,
-        attempts: PENDING_MAX_ATTEMPTS,
-        quarantinedAt: Date.now(),
+
+        attempts:
+          CONFIG.pendingMaxAttempts,
+
+        quarantinedAt:
+          Date.now(),
       };
 
-      const score = Date.now() + DEAD_LETTER_RETRY_MS;
+      const score =
+        Date.now() +
+        CONFIG.deadLetterRetryMs;
 
-      const queueKey = this.redis.key(
-        PENDING_TURN_KEY_PREFIX,
-        phone
-      );
-
-      const phonesKey = this.redis.key(PENDING_PHONES_KEY);
-
-      await this.redis.reschedulePendingItem({
+      const {
         queueKey,
         phonesKey,
-        phone,
-        payload: JSON.stringify(updated),
-        score,
-      });
+      } =
+        this._getQueueKeys(phone);
 
-      this.logWarn('Item colocado em quarentena.', phone, {
-        turnId: payload.turnId || null,
-        retryInMs: DEAD_LETTER_RETRY_MS,
-      });
+      if (
+        typeof this.redis
+          .reschedulePendingItem !==
+        'function'
+      ) {
+        throw new Error(
+          'reschedulePendingItem_unavailable'
+        );
+      }
+
+      const ok =
+        await this.redis
+          .reschedulePendingItem({
+            queueKey,
+            phonesKey,
+            phone,
+            payload:
+              JSON.stringify(
+                updated
+              ),
+            score,
+          });
+
+      if (!ok) {
+        throw new Error(
+          'quarantine_reschedule_failed'
+        );
+      }
+
+      this.logWarn(
+        'Item colocado em quarentena.',
+        phone,
+        {
+          turnId:
+            payload.turnId ||
+            null,
+
+          retryInMs:
+            CONFIG.deadLetterRetryMs,
+        }
+      );
     } catch (error) {
       this.logError(
         'Falha na quarentena do item.',
         error,
         phone,
-        { turnId: payload.turnId || null }
+        {
+          turnId:
+            payload.turnId ||
+            null,
+        }
       );
     }
   }
 
-  async _deadLetterPendingItem(phone, context = {}) {
-    const queueKey = this.redis.key(
-      PENDING_TURN_KEY_PREFIX,
-      phone
-    );
-
-    const phonesKey = this.redis.key(PENDING_PHONES_KEY);
-
-    const deadKey = this.redis.key(DEAD_LETTER_KEY);
+  async _deadLetterPendingItem(
+    phone,
+    context = {}
+  ) {
+    const {
+      queueKey,
+      phonesKey,
+      deadKey,
+    } =
+      this._getQueueKeys(phone);
 
     const item = {
       phone,
-      failedAt: Date.now(),
+      failedAt:
+        Date.now(),
       ...context,
     };
 
     try {
       if (
-        typeof this.redis.movePendingToDeadLetter !== 'function'
+        typeof this.redis
+          .movePendingToDeadLetter !==
+        'function'
       ) {
-        throw new Error('movePendingToDeadLetter_unavailable');
+        throw new Error(
+          'movePendingToDeadLetter_unavailable'
+        );
       }
 
-      const moved = await this.redis.movePendingToDeadLetter({
-        queueKey,
-        phonesKey,
-        deadKey,
-        phone,
-        payload: JSON.stringify(item),
-      });
+      const moved =
+        await this
+          .redis
+          .movePendingToDeadLetter({
+            queueKey,
+            phonesKey,
+            deadKey,
+            phone,
+            payload:
+              JSON.stringify(
+                item
+              ),
+          });
 
       if (moved) {
-        this.logWarn('Item enviado para dead-letter.', phone, {
-          reason: context.reason || 'unknown',
-          turnId: context.payload?.turnId || null,
-        });
+        this._metricIncrement(
+          'queueDeadLettered',
+          {
+            kind:
+              context.payload?.kind ||
+              'turn',
+
+            reason:
+              context.reason ||
+              'unknown',
+          }
+        );
+
+        this.logWarn(
+          'Item enviado para dead-letter.',
+          phone,
+          {
+            reason:
+              context.reason ||
+              'unknown',
+
+            turnId:
+              context.payload
+                ?.turnId ||
+              null,
+          }
+        );
       }
 
       return Boolean(moved);
     } catch (error) {
-      this.logError('Dead-letter falhou.', error, phone, {
-        reason: context.reason || 'unknown',
-        turnId: context.payload?.turnId || null,
-      });
+      this.logError(
+        'Dead-letter falhou.',
+        error,
+        phone,
+        {
+          reason:
+            context.reason ||
+            'unknown',
+
+          turnId:
+            context.payload
+              ?.turnId ||
+            null,
+        }
+      );
 
       return false;
     }
@@ -2069,16 +3349,31 @@ class InterviewService {
   // DEDUPE
   // ===========================================================================
 
-  async _forgetMessageSeen(messageId) {
-    if (!messageId) return;
+  async _forgetMessageSeen(
+    messageId
+  ) {
+    if (!messageId) {
+      return;
+    }
 
     try {
-      await this.redis.del(this.redis.key('msg', messageId));
+      await this.redis.del(
+        this.redis.key(
+          'msg',
+          messageId
+        )
+      );
     } catch (error) {
       this.logDebug(
         'Falha ao remover marker de dedupe.',
         null,
-        { msgId: messageId, error: errorMessage(error) }
+        {
+          msgId:
+            messageId,
+
+          error:
+            errorMessage(error),
+        }
       );
     }
   }
@@ -2087,107 +3382,181 @@ class InterviewService {
   // ENVIO
   // ===========================================================================
 
-  async sendBubbles(phone, bubbles, client = null) {
-    const result = await this._sendBubblesWithResult(
-      phone,
-      bubbles,
-      client || this._getWhatsAppService()
-    );
+  async sendBubbles(
+    phone,
+    bubbles,
+    client = null
+  ) {
+    const result =
+      await this
+        ._sendBubblesWithResult(
+          phone,
+          bubbles,
+          client ||
+            this._getWhatsAppService()
+        );
 
     return result.ok;
   }
 
-  async sendHuman(phone, text, client = null) {
-    const bubbles = this.splitBubbles(text);
+  async sendHuman(
+    phone,
+    text,
+    client = null
+  ) {
+    const bubbles =
+      this.splitBubbles(text);
 
-    if (!bubbles.length) return true;
+    if (!bubbles.length) {
+      return true;
+    }
 
-    const result = await this._sendBubblesWithResult(
-      phone,
-      bubbles,
-      client || this._getWhatsAppService()
-    );
+    const result =
+      await this
+        ._sendBubblesWithResult(
+          phone,
+          bubbles,
+          client ||
+            this._getWhatsAppService()
+        );
 
     return result.ok;
   }
 
-  async _sendText(phone, text, client = null) {
-    return this._sendBubblesWithResult(
-      phone,
-      this.splitBubbles(text),
-      client || this._getWhatsAppService()
-    );
+  async _sendText(
+    phone,
+    text,
+    client = null
+  ) {
+    return this
+      ._sendBubblesWithResult(
+        phone,
+        this.splitBubbles(text),
+        client ||
+          this._getWhatsAppService()
+      );
   }
 
-  async _sendBubblesWithResult(phone, bubbles, client = null) {
-    const normalized = this._extractBubbles(bubbles);
+  async _sendBubblesWithResult(
+    phone,
+    bubbles,
+    client = null
+  ) {
+    const normalized =
+      this._extractBubbles(
+        bubbles
+      );
 
     if (!normalized.length) {
-      return { ok: true, remaining: [] };
+      return {
+        ok: true,
+        remaining: [],
+      };
     }
 
-    const whatsappClient = client || this._getWhatsAppService();
+    const whatsappClient =
+      client ||
+      this._getWhatsAppService();
 
-    if (!this._isWhatsAppReady(whatsappClient)) {
-      return { ok: false, remaining: normalized };
-    }
-
-    for (let index = 0; index < normalized.length; index += 1) {
-      const sent = await this._sendHumanBubble(
-        phone,
-        normalized[index],
+    if (
+      !this._isWhatsAppReady(
         whatsappClient
-      );
+      )
+    ) {
+      return {
+        ok: false,
+        remaining:
+          normalized,
+      };
+    }
+
+    for (
+      let index = 0;
+      index < normalized.length;
+      index += 1
+    ) {
+      const sent =
+        await this._sendHumanBubble(
+          phone,
+          normalized[index],
+          whatsappClient
+        );
 
       if (!sent) {
         return {
           ok: false,
-          remaining: normalized.slice(index),
+          remaining:
+            normalized.slice(index),
         };
       }
 
-      if (index < normalized.length - 1) {
-        await this.delay(BUBBLE_PAUSE_MS);
+      if (
+        index <
+        normalized.length - 1
+      ) {
+        await this.delay(
+          CONFIG.bubblePauseMs
+        );
       }
     }
 
-    return { ok: true, remaining: [] };
+    return {
+      ok: true,
+      remaining: [],
+    };
   }
 
-  async _sendHumanBubble(phone, text, client) {
+  async _sendHumanBubble(
+    phone,
+    text,
+    client
+  ) {
     try {
-      if (typeof client.sendPresenceUpdate === 'function') {
+      if (
+        typeof client
+          .sendPresenceUpdate ===
+        'function'
+      ) {
         try {
-          await client.sendPresenceUpdate('composing', phone);
+          await client
+            .sendPresenceUpdate(
+              'composing',
+              phone
+            );
         } catch (_) {
           // Presence é best-effort.
         }
       }
 
-      const typingDelay = Math.min(
-        text.length * this.typingMsPerChar,
-        this.typingMax
-      );
+      const typingDelay =
+        Math.min(
+          text.length *
+            this.typingMsPerChar,
+          this.typingMax
+        );
 
       if (typingDelay > 0) {
-        await this.delay(typingDelay);
+        await this.delay(
+          typingDelay
+        );
       }
 
-      const result = await client.sendMessage(phone, text);
+      const result =
+        await client.sendMessage(
+          phone,
+          text
+        );
 
-      if (result === false) return false;
-
-      if (
-        result &&
-        typeof result === 'object' &&
-        result.status === 'failed'
-      ) {
-        return false;
-      }
-
-      return true;
+      return !isFailedSendResult(
+        result
+      );
     } catch (error) {
-      this.logError('Falha ao enviar mensagem.', error, phone);
+      this.logError(
+        'Falha ao enviar mensagem.',
+        error,
+        phone
+      );
+
       return false;
     }
   }
@@ -2196,79 +3565,158 @@ class InterviewService {
   // FALLBACK
   // ===========================================================================
 
-  _isFallbackCoolingDown(phone) {
-    const last = this._fallbackSentAt.get(phone);
+  _isFallbackCoolingDown(
+    phone
+  ) {
+    const last =
+      this._fallbackSentAt.get(
+        phone
+      );
 
-    if (!last) return false;
-
-    return Date.now() - last < FALLBACK_COOLDOWN_MS;
+    return Boolean(
+      last &&
+      Date.now() -
+        last <
+          CONFIG.fallbackCooldownMs
+    );
   }
 
-  _trackFallback(phone) {
-    const now = Date.now();
-
-    this._fallbackSentAt.set(phone, now);
+  _trackFallback(
+    phone,
+    timestamp = Date.now()
+  ) {
+    this._fallbackSentAt.set(
+      phone,
+      timestamp
+    );
 
     if (
-      this._fallbackSentAt.size < FALLBACK_MAP_SWEEP_THRESHOLD
+      this._fallbackSentAt.size <
+      CONFIG.fallbackSweepThreshold
     ) {
       return;
     }
 
-    for (const [key, timestamp] of this._fallbackSentAt) {
-      if (now - timestamp > FALLBACK_COOLDOWN_MS) {
-        this._fallbackSentAt.delete(key);
+    for (
+      const [
+        key,
+        createdAt,
+      ] of this._fallbackSentAt
+    ) {
+      if (
+        timestamp -
+          createdAt >
+        CONFIG.fallbackCooldownMs
+      ) {
+        this._fallbackSentAt.delete(
+          key
+        );
       }
     }
 
     if (
-      this._fallbackSentAt.size <= FALLBACK_MAP_HARD_LIMIT
+      this._fallbackSentAt.size <=
+      CONFIG.fallbackHardLimit
     ) {
       return;
     }
 
     const overflow =
-      this._fallbackSentAt.size - FALLBACK_MAP_HARD_LIMIT;
+      this._fallbackSentAt.size -
+      CONFIG.fallbackHardLimit;
 
     let removed = 0;
 
-    for (const key of this._fallbackSentAt.keys()) {
-      if (removed >= overflow) break;
+    for (
+      const key of
+      this._fallbackSentAt.keys()
+    ) {
+      if (
+        removed >=
+        overflow
+      ) {
+        break;
+      }
 
-      this._fallbackSentAt.delete(key);
+      this._fallbackSentAt.delete(
+        key
+      );
+
       removed += 1;
     }
   }
 
-  async _safeSendFallback(phone, client = null) {
-    const whatsappClient = client || this._getWhatsAppService();
+  async _safeSendFallback(
+    phone,
+    client = null
+  ) {
+    const whatsappClient =
+      client ||
+      this._getWhatsAppService();
 
-    if (!this._isWhatsAppReady(whatsappClient)) {
+    if (
+      !this._isWhatsAppReady(
+        whatsappClient
+      )
+    ) {
       return false;
     }
 
-    const normalizedPhone = normalizePhone(phone);
+    const normalizedPhone =
+      normalizePhone(phone);
 
-    if (!normalizedPhone) return false;
-
-    if (this._isFallbackCoolingDown(normalizedPhone)) {
+    if (!normalizedPhone) {
       return false;
     }
 
-    this._trackFallback(normalizedPhone);
+    if (
+      this._isFallbackCoolingDown(
+        normalizedPhone
+      ) ||
+      this._fallbackInFlight.has(
+        normalizedPhone
+      )
+    ) {
+      return false;
+    }
+
+    this._fallbackInFlight.add(
+      normalizedPhone
+    );
 
     try {
-      const result = await whatsappClient.sendMessage(
-        normalizedPhone,
-        SOFT_RECOVERY_MESSAGE
-      );
+      const result =
+        await whatsappClient.sendMessage(
+          normalizedPhone,
+          CONFIG.softRecoveryMessage
+        );
 
-      if (result === false) return false;
+      if (
+        isFailedSendResult(
+          result
+        )
+      ) {
+        return false;
+      }
+
+      // Só iniciar o cooldown depois de o envio ser confirmado.
+      this._trackFallback(
+        normalizedPhone
+      );
 
       return true;
     } catch (error) {
-      this.logError('Fallback falhou.', error, normalizedPhone);
+      this.logError(
+        'Fallback falhou.',
+        error,
+        normalizedPhone
+      );
+
       return false;
+    } finally {
+      this._fallbackInFlight.delete(
+        normalizedPhone
+      );
     }
   }
 
@@ -2276,44 +3724,73 @@ class InterviewService {
   // BUBBLES
   // ===========================================================================
 
-  _extractBubbles(bubbles) {
+  _extractBubbles(
+    bubbles
+  ) {
     if (!Array.isArray(bubbles)) {
       return [];
     }
 
-    return bubbles.map(clean).filter(Boolean);
+    return bubbles
+      .map(clean)
+      .filter(Boolean);
   }
 
   splitBubbles(text) {
-    const parts = String(text || '')
-      .split(/\n{2,}/)
-      .map(clean)
-      .filter(Boolean);
+    const parts =
+      String(text || '')
+        .split(/\n{2,}/)
+        .map(clean)
+        .filter(Boolean);
 
-    if (!parts.length) return [];
+    if (!parts.length) {
+      return [];
+    }
 
-    const merged = this.mergeSmallBubbles(parts);
+    const merged =
+      this.mergeSmallBubbles(
+        parts
+      );
 
-    if (merged.length <= 3) return merged;
+    if (merged.length <= 3) {
+      return merged;
+    }
 
     return [
       merged[0],
-      merged.slice(1, -1).join('\n\n'),
-      merged[merged.length - 1],
+
+      merged
+        .slice(1, -1)
+        .join('\n\n'),
+
+      merged[
+        merged.length - 1
+      ],
     ];
   }
 
-  mergeSmallBubbles(parts) {
+  mergeSmallBubbles(
+    parts
+  ) {
     const result = [];
 
     for (const part of parts) {
-      const previous = result[result.length - 1];
+      const previous =
+        result[
+          result.length - 1
+        ];
 
       if (
         previous &&
-        (previous.length < 60 || part.length < 40)
+        (
+          previous.length < 60 ||
+          part.length < 40
+        )
       ) {
-        result[result.length - 1] = `${previous}\n\n${part}`;
+        result[
+          result.length - 1
+        ] =
+          `${previous}\n\n${part}`;
       } else {
         result.push(part);
       }
@@ -2327,9 +3804,17 @@ class InterviewService {
   // ===========================================================================
 
   delay(ms) {
-    return new Promise((resolve) => {
-      setTimeout(resolve, Math.max(0, Number(ms) || 0));
-    });
+    return new Promise(
+      (resolve) => {
+        setTimeout(
+          resolve,
+          Math.max(
+            0,
+            Number(ms) || 0
+          )
+        );
+      }
+    );
   }
 }
 

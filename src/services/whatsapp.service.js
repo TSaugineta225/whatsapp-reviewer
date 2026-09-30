@@ -14,6 +14,18 @@
 // [FIX-4] Mensagens com LID não resolvível são reportadas como
 //         órfãs ao backend em vez de descartadas silenciosamente.
 //
+// [FIX-2.5] handleConnectionClose distingue três casos:
+//           - loggedOut (401): limpar credenciais, novo QR
+//           - connectionReplaced (440): NÃO retentar. Outro
+//             dispositivo assumiu a sessão. Retentar é inútil e
+//             cria loop. Operador tem de agir.
+//           - resto: backoff normal
+//
+// [FIX-2.6] extractMessageContent reconhece mensagens de mídia
+//           (imagem, áudio, vídeo, documento, sticker). Antes eram
+//           descartadas silenciosamente — o candidato ficava sem
+//           resposta sem perceber porquê.
+//
 // PRINCÍPIOS
 // - Uma única instância do socket por número.
 // - O processamento de negócio continua no InterviewService.
@@ -76,6 +88,21 @@ const WHATSAPP_SUFFIX = '@s.whatsapp.net';
 const GROUP_SUFFIX = '@g.us';
 const LID_SUFFIX = '@lid';
 const NEWSLETTER_SUFFIX = '@newsletter';
+
+// [FIX-2.5] código do WhatsApp para "sessão substituída por outro
+// dispositivo". Não usar DisconnectReason.connectionReplaced
+// directamente porque a constante pode não existir em versões mais
+// antigas do Baileys.
+const STATUS_CONNECTION_REPLACED = 440;
+
+// [FIX-2.6] mensagens de mídia que reconhecemos mas não processamos.
+const MEDIA_MESSAGE_TYPES = [
+  'imageMessage',
+  'videoMessage',
+  'audioMessage',
+  'documentMessage',
+  'stickerMessage',
+];
 
 const TRANSIENT_ERROR_CODES = new Set([
   'ECONNRESET',
@@ -222,10 +249,6 @@ class WhatsAppService extends BaseService {
       interviewService.redis ||
       new RedisService();
 
-    // -------------------------------------------------------------------------
-    // Socket / lifecycle
-    // -------------------------------------------------------------------------
-
     this.socket = null;
 
     this.isReady = false;
@@ -238,45 +261,32 @@ class WhatsAppService extends BaseService {
 
     this.connectedAt = null;
 
+    // Promises de lifecycle impedem initialize/reset concorrentes de criarem
+    // sockets sobrepostos ou deixarem operações antigas mutarem o estado atual.
     this._initializePromise = null;
+    this._resetPromise = null;
     this._lifecycleGeneration = 0;
     this._socketGeneration = 0;
 
     this.qrCode = null;
-
-    // -------------------------------------------------------------------------
-    // Config
-    // -------------------------------------------------------------------------
 
     this.defaultCountryCode =
       digitsOnly(
         process.env.DEFAULT_COUNTRY_CODE || DEFAULT_COUNTRY_CODE
       ) || DEFAULT_COUNTRY_CODE;
 
-    // -------------------------------------------------------------------------
-    // Read receipts
-    // -------------------------------------------------------------------------
-
     this.lastReadTimestamps = new Map();
+    this._readReceiptInFlight = new Set();
 
-    // -------------------------------------------------------------------------
-    // [FIX-2] LID → PN cache em memória (write-through para Redis).
-    // -------------------------------------------------------------------------
+    // Evita duas operações de !reset simultâneas para o mesmo candidato.
+    this._conversationResetLocks = new Map();
 
     this._lidToPhoneCache = new Map();
-
-    // -------------------------------------------------------------------------
-    // Logging
-    // -------------------------------------------------------------------------
 
     this.logger = pino({
       level: process.env.LOG_LEVEL || 'info',
       base: { service: 'whatsapp' },
     });
-
-    // -------------------------------------------------------------------------
-    // Shutdown
-    // -------------------------------------------------------------------------
 
     this._boundShutdown = this._handleProcessShutdown.bind(this);
 
@@ -313,8 +323,16 @@ class WhatsAppService extends BaseService {
         continue;
       }
 
-      if (key === 'remoteJid' || key === 'jid' || key === 'altJid') {
-        safe[key] = maskJid(value);
+      if (
+        key === 'remoteJid' ||
+        key === 'jid' ||
+        key === 'altJid' ||
+        key === 'participant' ||
+        key === 'participantAlt' ||
+        key === 'session' ||
+        key === 'lid'
+      ) {
+        safe[key] = this._maskIdentifier(value);
         continue;
       }
 
@@ -326,6 +344,124 @@ class WhatsAppService extends BaseService {
     }
 
     return safe;
+  }
+
+  _maskIdentifier(value) {
+    const raw = clean(value);
+
+    if (!raw) return '';
+
+    if (raw.includes('@')) {
+      return maskJid(raw);
+    }
+
+    if (/^\d[\d:\-\s]*$/.test(raw)) {
+      return maskPhone(raw);
+    }
+
+    if (raw.length <= 4) {
+      return '***';
+    }
+
+    return `${raw.slice(0, 2)}***${raw.slice(-2)}`;
+  }
+
+  _safeMetricInc(metric, labels = {}, metricName = 'unknown') {
+    try {
+      if (metric && typeof metric.inc === 'function') {
+        metric.inc(labels);
+      }
+    } catch (error) {
+      this._log(
+        'warn',
+        'Falha ao registar métrica; operação ignorada.',
+        {
+          metric: metricName,
+          error: error?.message || String(error),
+        }
+      );
+    }
+  }
+
+  _safeMetricSet(metric, value, metricName = 'unknown') {
+    try {
+      if (metric && typeof metric.set === 'function') {
+        metric.set(value);
+      }
+    } catch (error) {
+      this._log(
+        'warn',
+        'Falha ao atualizar métrica; operação ignorada.',
+        {
+          metric: metricName,
+          error: error?.message || String(error),
+        }
+      );
+    }
+  }
+
+  async _safeMetricTime(metric, labels, fn, metricName = 'unknown') {
+    if (typeof fn !== 'function') return undefined;
+
+    if (!metric || typeof metrics?.time !== 'function') {
+      return fn();
+    }
+
+    let businessSettled = false;
+    let businessResult;
+    let businessError = null;
+
+    const wrapped = async () => {
+      try {
+        businessResult = await fn();
+        businessSettled = true;
+        return businessResult;
+      } catch (error) {
+        businessError = error;
+        businessSettled = true;
+        throw error;
+      }
+    };
+
+    try {
+      const instrumentedResult = await metrics.time(
+        metric,
+        labels || {},
+        wrapped
+      );
+
+      return businessSettled ? businessResult : instrumentedResult;
+    } catch (error) {
+      // Se o callback de negócio já foi executado, não transformamos uma
+      // falha da instrumentação em falha do envio/processamento.
+      if (businessError) {
+        throw businessError;
+      }
+
+      if (businessSettled) {
+        this._log(
+          'warn',
+          'Falha na instrumentação da métrica; resultado do negócio preservado.',
+          {
+            metric: metricName,
+            error: error?.message || String(error),
+          }
+        );
+
+        return businessResult;
+      }
+
+      this._log(
+        'warn',
+        'Falha ao iniciar medição; executando operação sem instrumentação.',
+        {
+          metric: metricName,
+          error: error?.message || String(error),
+        }
+      );
+
+      return fn();
+    }
   }
 
   log(message, context = {}) {
@@ -447,7 +583,6 @@ class WhatsAppService extends BaseService {
     }
 
     if (value.endsWith(LID_SUFFIX)) {
-      // Nunca enviar diretamente para um LID não resolvido.
       return '';
     }
 
@@ -488,10 +623,14 @@ class WhatsAppService extends BaseService {
   }
 
   // ===========================================================================
-  // [FIX-2] LID → PHONE
+  // LID → PHONE
   // ===========================================================================
 
-  async resolveJidToPhone(primaryJid, altJid = null) {
+  async resolveJidToPhone(
+    primaryJid,
+    altJid = null,
+    socket = this.socket
+  ) {
     const primary = String(primaryJid || '').trim();
     const alt = String(altJid || '').trim();
 
@@ -505,7 +644,6 @@ class WhatsAppService extends BaseService {
       return '';
     }
 
-    // 1. alt JID.
     if (alt) {
       if (alt.endsWith(WHATSAPP_SUFFIX)) {
         const phone = this.normalizePhone(alt.split('@')[0]);
@@ -524,19 +662,16 @@ class WhatsAppService extends BaseService {
       }
     }
 
-    // 2. remoteJid já é PN.
     if (primary.endsWith(WHATSAPP_SUFFIX)) {
       const phone = this.normalizePhone(primary.split('@')[0]);
 
       return this.isValidPhone(phone) ? phone : '';
     }
 
-    // 3. LID — resolve via cache/Redis/signalRepository.
     if (primary.endsWith(LID_SUFFIX)) {
-      return this._resolveLidToPhone(primary);
+      return this._resolveLidToPhone(primary, socket);
     }
 
-    // 4. fallback defensivo.
     const digits = digitsOnly(primary);
 
     if (digits.length >= 8) {
@@ -556,16 +691,14 @@ class WhatsAppService extends BaseService {
     return digits ? `${digits}${LID_SUFFIX}` : '';
   }
 
-  async _resolveLidToPhone(lidJid) {
+  async _resolveLidToPhone(lidJid, socket = this.socket) {
     const canonicalLid = this.normalizeLidJid(lidJid);
 
     if (!canonicalLid) return '';
 
-    // 1. cache em memória.
     const cached = this._lidToPhoneCache.get(canonicalLid);
     if (cached) return cached;
 
-    // 2. [FIX-2] Redis — mapping persistido quando enviamos o convite.
     try {
       const fromRedis = await this.redis.resolveLidMapping(canonicalLid);
 
@@ -584,9 +717,10 @@ class WhatsAppService extends BaseService {
       });
     }
 
-    // 3. signalRepository do Baileys (best-effort).
     try {
-      const mapping = this.socket?.signalRepository?.lidMapping;
+      // Use o socket associado ao evento. this.socket pode já apontar
+      // para uma nova geração quando esta operação assíncrona terminar.
+      const mapping = socket?.signalRepository?.lidMapping;
 
       if (
         mapping &&
@@ -597,7 +731,6 @@ class WhatsAppService extends BaseService {
         const phone = this.normalizePhone(String(pn || ''));
 
         if (this.isValidPhone(phone)) {
-          // Persistir para futuras consultas.
           await this._persistLidMapping(canonicalLid, phone);
           this._rememberLidMapping(canonicalLid, phone);
           return phone;
@@ -655,18 +788,6 @@ class WhatsAppService extends BaseService {
     this._lidToPhoneCache.clear();
   }
 
-  // ===========================================================================
-  // [FIX-2] Captura do JID real associado à mensagem enviada
-  // ===========================================================================
-
-  /**
-   * Extrai o JID devolvido pelo Baileys e, se for um LID, persiste
-   * a associação LID → PN.
-   *
-   * É chamado imediatamente após um `socket.sendMessage` bem-sucedido.
-   * O `chatId` de destino já é um PN (o candidato convidado); o JID
-   * devolvido pode ser um LID que o WhatsApp associou.
-   */
   async _captureLidMappingFromResponse(response, chatId) {
     try {
       const usedJid = response?.key?.remoteJid;
@@ -675,12 +796,10 @@ class WhatsAppService extends BaseService {
         return;
       }
 
-      // Só nos interessa quando o WhatsApp devolve um LID.
       if (!usedJid.endsWith(LID_SUFFIX)) {
         return;
       }
 
-      // O destino era um PN — extrair o número.
       const phone = this.normalizePhone(chatId);
 
       if (!this.isValidPhone(phone)) {
@@ -691,7 +810,6 @@ class WhatsAppService extends BaseService {
 
       if (!canonicalLid) return;
 
-      // Se já temos o mapping em cache, não vale a pena escrever.
       if (this._lidToPhoneCache.get(canonicalLid) === phone) {
         return;
       }
@@ -721,21 +839,54 @@ class WhatsAppService extends BaseService {
   async initialize() {
     if (this.isShuttingDown) return false;
 
+    // Um reset invalida a sessão anterior. Quem pedir initialize durante
+    // esse período aguarda a operação e usa o socket que ficar vigente.
+    if (this._resetPromise) {
+      try {
+        await this._resetPromise;
+      } catch (error) {
+        this.logError(
+          'Erro numa operação de reset aguardada por initialize().',
+          error
+        );
+      }
+
+      if (this.isShuttingDown) return false;
+    }
+
+    return this._startInitialization();
+  }
+
+  _startInitialization() {
+    if (this.isShuttingDown) return Promise.resolve(false);
+
+    if (this.isReady && this.socket) {
+      return Promise.resolve(true);
+    }
+
     if (this._initializePromise) {
       return this._initializePromise;
     }
 
-    if (this.isConnecting) return false;
+    if (this.isConnecting) {
+      return Promise.resolve(false);
+    }
 
     const lifecycleGeneration = this._lifecycleGeneration;
 
-    this._initializePromise = this._initializeInternal(
+    let trackedPromise;
+
+    trackedPromise = this._initializeInternal(
       lifecycleGeneration
     ).finally(() => {
-      this._initializePromise = null;
+      if (this._initializePromise === trackedPromise) {
+        this._initializePromise = null;
+      }
     });
 
-    return this._initializePromise;
+    this._initializePromise = trackedPromise;
+
+    return trackedPromise;
   }
 
   async _initializeInternal(lifecycleGeneration) {
@@ -843,13 +994,24 @@ class WhatsAppService extends BaseService {
 
       return true;
     } catch (error) {
-      this.isConnecting = false;
-      this.isReady = false;
-      this.qrCode = null;
+      const ownsLifecycle =
+        lifecycleGeneration === this._lifecycleGeneration;
+
+      if (ownsLifecycle) {
+        this.isConnecting = false;
+        this.isReady = false;
+        this.qrCode = null;
+      }
 
       this.logError('Erro ao inicializar WhatsApp.', error);
 
-      if (!this.isShuttingDown) {
+      // Uma inicialização antiga pode terminar depois de um reset/shutdown.
+      // Nunca deixe essa operação antiga agendar um reconnect por cima da
+      // geração atual.
+      if (
+        ownsLifecycle &&
+        !this.isShuttingDown
+      ) {
         this.scheduleReconnect();
       }
 
@@ -872,7 +1034,11 @@ class WhatsAppService extends BaseService {
       });
     });
 
-    socket.ev.on('creds.update', saveCreds);
+    socket.ev.on('creds.update', (creds) => {
+      Promise.resolve(saveCreds(creds)).catch((error) => {
+        this.logError('Erro ao persistir credenciais do WhatsApp.', error);
+      });
+    });
 
     socket.ev.on('messages.upsert', (event) => {
       void this.handleMessagesUpsert(
@@ -902,10 +1068,6 @@ class WhatsAppService extends BaseService {
       socketGeneration === this._socketGeneration
     );
   }
-
-  // ===========================================================================
-  // CONNECTION UPDATE
-  // ===========================================================================
 
   async handleConnectionUpdate(
     update,
@@ -962,7 +1124,11 @@ class WhatsAppService extends BaseService {
     this.clearRetryTimer();
     this.clearLogoutRestartTimer();
 
-    metrics.whatsappConnected.set(1);
+    this._safeMetricSet(
+      metrics.whatsappConnected,
+      1,
+      'whatsappConnected'
+    );
 
     const user = socket?.user;
 
@@ -972,6 +1138,7 @@ class WhatsAppService extends BaseService {
     });
   }
 
+  // [FIX-2.5] três casos distintos.
   async handleConnectionClose(
     lastDisconnect,
     socket = this.socket,
@@ -982,8 +1149,6 @@ class WhatsAppService extends BaseService {
     }
 
     const statusCode = this.getDisconnectStatusCode(lastDisconnect);
-    const loggedOut =
-      statusCode === DisconnectReason.loggedOut;
 
     this.socket = null;
     this.isReady = false;
@@ -991,13 +1156,18 @@ class WhatsAppService extends BaseService {
     this.qrCode = null;
     this.connectedAt = null;
 
-    metrics.whatsappConnected.set(0);
+    this._safeMetricSet(
+      metrics.whatsappConnected,
+      0,
+      'whatsappConnected'
+    );
 
     this.log('WhatsApp desconectado.', {
       statusCode: statusCode || 'unknown',
     });
 
-    if (loggedOut) {
+    // Caso 1: sessão explicitamente encerrada pelo WhatsApp.
+    if (statusCode === DisconnectReason.loggedOut) {
       this.log(
         'Sessão encerrada pelo WhatsApp. Limpando credenciais '
         + 'e preparando novo login.'
@@ -1010,17 +1180,41 @@ class WhatsAppService extends BaseService {
       return;
     }
 
+    // [FIX-2.5] Caso 2: outro dispositivo assumiu a sessão.
+    // Retentar é inútil — só re-autenticação manual resolve.
+    if (statusCode === STATUS_CONNECTION_REPLACED) {
+      this.logError(
+        'Sessão substituída por outro dispositivo. '
+        + 'Re-autenticação manual necessária — sem retry automático.',
+        null,
+        { statusCode }
+      );
+
+      this._safeMetricInc(
+        metrics.errorsTotal,
+        { subsystem: 'whatsapp' },
+        'errorsTotal'
+      );
+
+      // Não chamar scheduleReconnect. Operador tem de agir.
+      return;
+    }
+
+    // Caso 3: queda transitória — backoff normal.
     if (this.isShuttingDown) return;
 
     this.scheduleReconnect();
   }
 
   getDisconnectStatusCode(lastDisconnect) {
-    return (
-      lastDisconnect?.error?.output?.statusCode ||
-      lastDisconnect?.error?.statusCode ||
-      null
-    );
+    const raw =
+      lastDisconnect?.error?.output?.statusCode ??
+      lastDisconnect?.error?.statusCode ??
+      null;
+
+    const numeric = Number(raw);
+
+    return Number.isFinite(numeric) ? numeric : raw;
   }
 
   // ===========================================================================
@@ -1032,7 +1226,8 @@ class WhatsAppService extends BaseService {
       this.retryTimer ||
       this.isShuttingDown ||
       this.isConnecting ||
-      this.isReady
+      this.isReady ||
+      this._resetPromise
     ) {
       return;
     }
@@ -1053,6 +1248,7 @@ class WhatsAppService extends BaseService {
 
     const jitter = 0.8 + Math.random() * 0.4;
     const delay = Math.round(exponential * jitter);
+    const lifecycleGeneration = this._lifecycleGeneration;
 
     this.log(
       `Reconexão ${this.retryCount}/${MAX_RETRIES} agendada.`,
@@ -1061,6 +1257,14 @@ class WhatsAppService extends BaseService {
 
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
+
+      if (
+        this.isShuttingDown ||
+        this._resetPromise ||
+        lifecycleGeneration !== this._lifecycleGeneration
+      ) {
+        return;
+      }
 
       void this.initialize().catch((error) => {
         this.logError('Falha na tentativa de reconexão.', error);
@@ -1078,14 +1282,26 @@ class WhatsAppService extends BaseService {
   }
 
   _scheduleLogoutRestart() {
-    if (this.logoutRestartTimer || this.isShuttingDown) {
+    if (
+      this.logoutRestartTimer ||
+      this.isShuttingDown ||
+      this._resetPromise
+    ) {
       return;
     }
+
+    const lifecycleGeneration = this._lifecycleGeneration;
 
     this.logoutRestartTimer = setTimeout(() => {
       this.logoutRestartTimer = null;
 
-      if (this.isShuttingDown) return;
+      if (
+        this.isShuttingDown ||
+        this._resetPromise ||
+        lifecycleGeneration !== this._lifecycleGeneration
+      ) {
+        return;
+      }
 
       this.retryCount = 0;
 
@@ -1137,7 +1353,13 @@ class WhatsAppService extends BaseService {
       : [];
 
     for (const message of messages) {
-      void this.processIncomingMessage(message).catch((error) => {
+      // O listener do Baileys permanece livre; cada mensagem é tratada
+      // de forma independente e nunca bloqueia a entrega dos próximos eventos.
+      void this.processIncomingMessage(
+        message,
+        socket,
+        socketGeneration
+      ).catch((error) => {
         this.logError(
           'Erro no processamento assíncrono da mensagem.',
           error,
@@ -1147,7 +1369,15 @@ class WhatsAppService extends BaseService {
     }
   }
 
-  async processIncomingMessage(msg) {
+  async processIncomingMessage(
+    msg,
+    socket = this.socket,
+    socketGeneration = this._socketGeneration
+  ) {
+    if (!this.isCurrentSocket(socket, socketGeneration)) {
+      return;
+    }
+
     if (!msg?.message) return;
     if (msg.key?.fromMe) return;
 
@@ -1155,15 +1385,26 @@ class WhatsAppService extends BaseService {
 
     if (!rawJid || rawJid === STATUS_BROADCAST) return;
 
+    if (
+      rawJid.endsWith(GROUP_SUFFIX) ||
+      rawJid.endsWith(NEWSLETTER_SUFFIX)
+    ) {
+      return;
+    }
+
     const altJid =
       msg.key?.remoteJidAlt ||
       msg.key?.participantAlt ||
       null;
 
-    const phone = await this.resolveJidToPhone(rawJid, altJid);
+    // Nunca use this.socket aqui: durante uma reconexão ele pode já ser
+    // uma geração diferente da que originou o evento.
+    const phone = await this.resolveJidToPhone(
+      rawJid,
+      altJid,
+      socket
+    );
 
-    // [FIX-4] Mensagens com LID não resolvível são reportadas como
-    // órfãs ao backend em vez de descartadas silenciosamente.
     if (!phone) {
       this.logWarn(
         'Mensagem ignorada: JID não resolvível para telefone.',
@@ -1174,7 +1415,11 @@ class WhatsAppService extends BaseService {
         }
       );
 
-      metrics.errorsTotal.inc({ subsystem: 'whatsapp' });
+      this._safeMetricInc(
+        metrics.errorsTotal,
+        { subsystem: 'whatsapp' },
+        'errorsTotal'
+      );
 
       await this._reportUnresolvableIncoming({
         rawJid,
@@ -1187,17 +1432,27 @@ class WhatsAppService extends BaseService {
 
     const parsed = this.extractMessageContent(msg);
 
-    if (!parsed.text && !parsed.isButtonClick) {
+    if (
+      !parsed.text &&
+      !parsed.isButtonClick &&
+      !parsed.isMedia
+    ) {
       return;
     }
 
     const type = parsed.isButtonClick
       ? 'button'
-      : parsed.text
-        ? 'text'
-        : 'other';
+      : parsed.isMedia
+        ? 'media'
+        : parsed.text
+          ? 'text'
+          : 'other';
 
-    metrics.messagesReceived.inc({ type });
+    this._safeMetricInc(
+      metrics.messagesReceived,
+      { type },
+      'messagesReceived'
+    );
 
     this.log('Mensagem recebida.', {
       phone,
@@ -1205,17 +1460,21 @@ class WhatsAppService extends BaseService {
       msgId: msg.key?.id || null,
       type,
       textLength: parsed.text ? parsed.text.length : 0,
+      mediaType: parsed.mediaType || null,
     });
 
     await this.handleMessage(
       phone,
       parsed.text,
       parsed.isButtonClick,
-      msg.key?.id || null
+      msg.key?.id || null,
+      {
+        isMedia: parsed.isMedia,
+        mediaType: parsed.mediaType,
+      }
     );
   }
 
-  // [FIX-4] reportar mensagens não resolvíveis ao backend.
   async _reportUnresolvableIncoming({
     rawJid,
     altJid,
@@ -1231,7 +1490,6 @@ class WhatsAppService extends BaseService {
 
       const parsed = this.extractMessageContent(message);
 
-      // O backend aceita phone OU jid como identificador.
       await reportUnmatched({
         phone: null,
         jid: rawJid,
@@ -1240,7 +1498,6 @@ class WhatsAppService extends BaseService {
         messageId: message?.key?.id || null,
       });
     } catch (error) {
-      // Best-effort.
       this.logWarn('Falha ao reportar mensagem órfã.', {
         remoteJid: rawJid,
         error: error?.message,
@@ -1254,7 +1511,7 @@ class WhatsAppService extends BaseService {
 
   extractMessageContent(msg) {
     if (!msg?.message) {
-      return { text: '', isButtonClick: false };
+      return { text: '', isButtonClick: false, isMedia: false };
     }
 
     const message =
@@ -1264,6 +1521,7 @@ class WhatsAppService extends BaseService {
       return {
         text: String(message.conversation).trim(),
         isButtonClick: false,
+        isMedia: false,
       };
     }
 
@@ -1271,6 +1529,7 @@ class WhatsAppService extends BaseService {
       return {
         text: String(message.extendedTextMessage.text).trim(),
         isButtonClick: false,
+        isMedia: false,
       };
     }
 
@@ -1290,6 +1549,7 @@ class WhatsAppService extends BaseService {
             ''
         ).trim(),
         isButtonClick: true,
+        isMedia: false,
       };
     }
 
@@ -1303,6 +1563,7 @@ class WhatsAppService extends BaseService {
             ''
         ).trim(),
         isButtonClick: true,
+        isMedia: false,
       };
     }
 
@@ -1316,10 +1577,27 @@ class WhatsAppService extends BaseService {
             ''
         ).trim(),
         isButtonClick: true,
+        isMedia: false,
       };
     }
 
-    return { text: '', isButtonClick: false };
+    // Mídia é sinalizada explicitamente. O texto fica vazio quando não
+    // existe legenda, permitindo que handleMessage execute a resposta
+    // específica para ficheiros em vez de tratar o placeholder como texto.
+    for (const mediaType of MEDIA_MESSAGE_TYPES) {
+      const media = message[mediaType];
+
+      if (media) {
+        return {
+          text: clean(media.caption || ''),
+          isButtonClick: false,
+          isMedia: true,
+          mediaType,
+        };
+      }
+    }
+
+    return { text: '', isButtonClick: false, isMedia: false };
   }
 
   extractInteractiveResponse(response) {
@@ -1345,6 +1623,7 @@ class WhatsAppService extends BaseService {
             return {
               text: String(selected).trim(),
               isButtonClick: true,
+              isMedia: false,
             };
           }
         } catch (_) {
@@ -1354,12 +1633,14 @@ class WhatsAppService extends BaseService {
         return {
           text: String(nativeFlow.text || params).trim(),
           isButtonClick: true,
+          isMedia: false,
         };
       }
 
       return {
         text: String(nativeFlow.text || '').trim(),
         isButtonClick: true,
+        isMedia: false,
       };
     }
 
@@ -1373,29 +1654,52 @@ class WhatsAppService extends BaseService {
             ''
         ).trim(),
         isButtonClick: true,
+        isMedia: false,
       };
     }
 
-    return { text: '', isButtonClick: false };
+    return { text: '', isButtonClick: false, isMedia: false };
   }
 
   // ===========================================================================
   // PROCESSAMENTO DE NEGÓCIO
   // ===========================================================================
 
-  async handleMessage(from, text, isButton = false, messageId = null) {
+  async handleMessage(
+    from,
+    text,
+    isButton = false,
+    messageId = null,
+    options = {}
+  ) {
     if (!from) return;
 
     const normalizedText = String(text || '').trim();
 
+    // Mídia sem legenda precisa chegar aqui com text vazio. Isso evita
+    // confundir a indicação de mídia com uma mensagem textual.
+    if (options.isMedia && !normalizedText) {
+      await this.sendMessage(
+        from,
+        'Recebi o seu ficheiro. Nesta conversa só consigo ler texto. '
+        + 'Pode escrever o que quiser partilhar?'
+      );
+      return;
+    }
+
     if (!normalizedText) return;
 
     if (this.isResetCommand(normalizedText)) {
-      await this.interviewService.forgetInterview(from);
+      const resetResult =
+        await this.resetInterviewConversation(from);
 
       await this.sendMessage(
         from,
-        'Sessão reiniciada. Envie uma nova mensagem quando estiver pronto.'
+        resetResult
+          ? 'A ligação a esta conversa foi limpa. Se quiser recomeçar '
+            + 'o processo, contacte a equipa de RH.'
+          : 'Não foi possível limpar completamente a conversa agora. '
+            + 'Tente novamente em instantes ou contacte a equipa de RH.'
       );
 
       return;
@@ -1405,13 +1709,109 @@ class WhatsAppService extends BaseService {
       await this.interviewService.handleIncomingMessage(
         from,
         normalizedText,
-        { messageId, isButton }
+        {
+          messageId,
+          isButton,
+          isMedia: Boolean(options.isMedia),
+          mediaType: options.mediaType || null,
+        }
       );
     } catch (error) {
       this.logError('Erro ao processar mensagem.', error, {
         phone: from,
         msgId: messageId,
       });
+    }
+  }
+
+  async resetInterviewConversation(from) {
+    const lockKey = this.normalizePhone(from) || String(from || '').trim();
+
+    if (!lockKey) return false;
+
+    const existing = this._conversationResetLocks.get(lockKey);
+
+    if (existing) {
+      return existing;
+    }
+
+    const promise = this._resetInterviewConversationInternal(from)
+      .catch((error) => {
+        this.logError(
+          'Erro inesperado ao executar reset da conversa.',
+          error,
+          { phone: from }
+        );
+
+        return false;
+      })
+      .finally(() => {
+        this._conversationResetLocks.delete(lockKey);
+      });
+
+    this._conversationResetLocks.set(lockKey, promise);
+
+    return promise;
+  }
+
+  async _resetInterviewConversationInternal(from) {
+    let interviewId = null;
+
+    try {
+      // [FIX-2.7] Resolver PRIMEIRO. O estado local não pode ser apagado
+      // antes de descobrir qual entrevista deve ser cancelada no backend.
+      if (
+        typeof this.interviewService.resolveInterviewId === 'function'
+      ) {
+        interviewId =
+          await this.interviewService.resolveInterviewId(from);
+      }
+
+      if (interviewId) {
+        const cancelInterview =
+          this.interviewService.yane?.cancelInterview;
+
+        if (typeof cancelInterview !== 'function') {
+          throw new Error(
+            'cancelInterview indisponível no backend para reset de entrevista.'
+          );
+        }
+
+        await cancelInterview.call(
+          this.interviewService.yane,
+          interviewId,
+          'candidate_reset'
+        );
+      }
+
+      // Só depois da sincronização com o backend limpamos o estado local.
+      if (
+        typeof this.interviewService.forgetInterview !== 'function'
+      ) {
+        throw new Error(
+          'forgetInterview indisponível no InterviewService.'
+        );
+      }
+
+      await this.interviewService.forgetInterview(from);
+
+      this.log('Reset de conversa concluído.', {
+        phone: from,
+        session: interviewId || null,
+      });
+
+      return true;
+    } catch (error) {
+      this.logWarn('Falha ao sincronizar reset da entrevista.', {
+        phone: from,
+        session: interviewId || null,
+        error: error?.message || String(error),
+      });
+
+      // Importante: não apagamos o estado local se o cancelamento backend
+      // de uma entrevista existente falhar. Isso evita deixar Redis e backend
+      // em estados divergentes.
+      return false;
     }
   }
 
@@ -1450,34 +1850,71 @@ class WhatsAppService extends BaseService {
 
       if (!key?.remoteJid || !key?.id) continue;
 
-      await this.handleReadReceipt(key);
+      // Read receipt é best-effort. Não aguardamos o backend dentro da fila
+      // de updates do Baileys, evitando que um request lento atrase os demais.
+      void this.handleReadReceipt(
+        key,
+        socket,
+        socketGeneration
+      ).catch((error) => {
+        this.logError('Erro ao processar read receipt.', error, {
+          msgId: key?.id || null,
+        });
+      });
     }
   }
 
-  async handleReadReceipt(key) {
+  async handleReadReceipt(
+    key,
+    socket = this.socket,
+    socketGeneration = this._socketGeneration
+  ) {
+    if (!this.isCurrentSocket(socket, socketGeneration)) {
+      return;
+    }
+
     const rawJid = key?.remoteJid;
     const messageId = key?.id;
 
     if (!rawJid || !messageId) return;
 
-    const altJid = key?.remoteJidAlt || null;
+    const inFlightKey = `${rawJid}|${messageId}`;
 
-    const phone = await this.resolveJidToPhone(rawJid, altJid);
+    if (this._readReceiptInFlight.has(inFlightKey)) {
+      return;
+    }
 
-    if (!phone) return;
+    this._readReceiptInFlight.add(inFlightKey);
 
-    if (this.isReadReceiptDebounced(phone)) return;
+    try {
+      const altJid = key?.remoteJidAlt || key?.participantAlt || null;
 
-    this.lastReadTimestamps.set(phone, Date.now());
+      const phone = await this.resolveJidToPhone(
+        rawJid,
+        altJid,
+        socket
+      );
 
-    this.trimReadCache();
+      if (!phone) return;
 
-    this.log('Mensagem lida pelo candidato.', {
-      phone,
-      msgId: messageId,
-    });
+      if (this.isReadReceiptDebounced(phone)) return;
 
-    await this.notifyBackendMessageRead({ phone, messageId });
+      this.lastReadTimestamps.set(phone, Date.now());
+      this.trimReadCache();
+
+      this.log('Mensagem lida pelo candidato.', {
+        phone,
+        msgId: messageId,
+        participant: key?.participant || null,
+      });
+
+      await this.notifyBackendMessageRead({
+        phone,
+        messageId,
+      });
+    } finally {
+      this._readReceiptInFlight.delete(inFlightKey);
+    }
   }
 
   isReadReceiptDebounced(phone) {
@@ -1572,8 +2009,17 @@ class WhatsAppService extends BaseService {
       const allowed = await this.waitForRateLimit();
 
       if (!allowed) {
-        metrics.messagesSent.inc({ status: 'rate_limited' });
-        metrics.rateLimitHits.inc({ bucket: 'out' });
+        this._safeMetricInc(
+          metrics.messagesSent,
+          { status: 'rate_limited' },
+          'messagesSent'
+        );
+
+        this._safeMetricInc(
+          metrics.rateLimitHits,
+          { bucket: 'out' },
+          'rateLimitHits'
+        );
 
         this.logError(
           'Rate limit excedido e tempo máximo de espera atingido.',
@@ -1604,20 +2050,28 @@ class WhatsAppService extends BaseService {
       }
 
       try {
-        const response = await metrics.time(
+        const response = await this._safeMetricTime(
           metrics.messageSendDuration,
           { attempt: String(attempt) },
-          () => socket.sendMessage(chatId, payload)
+          () => socket.sendMessage(chatId, payload),
+          'messageSendDuration'
         );
 
-        // [FIX-2] capturar o LID associado ao destino.
-        // Best-effort: nunca bloqueia o envio.
         void this._captureLidMappingFromResponse(
           response,
           chatId
-        );
+        ).catch((error) => {
+          this.logWarn(
+            'Falha assíncrona ao guardar mapeamento LID → PN.',
+            { error: error?.message || String(error) }
+          );
+        });
 
-        metrics.messagesSent.inc({ status: 'success' });
+        this._safeMetricInc(
+          metrics.messagesSent,
+          { status: 'success' },
+          'messagesSent'
+        );
 
         this.log('Mensagem enviada.', {
           recipient: this.formatLogRecipient(chatId),
@@ -1657,8 +2111,17 @@ class WhatsAppService extends BaseService {
       }
     }
 
-    metrics.messagesSent.inc({ status: 'failed' });
-    metrics.errorsTotal.inc({ subsystem: 'whatsapp' });
+    this._safeMetricInc(
+      metrics.messagesSent,
+      { status: 'failed' },
+      'messagesSent'
+    );
+
+    this._safeMetricInc(
+      metrics.errorsTotal,
+      { subsystem: 'whatsapp' },
+      'errorsTotal'
+    );
 
     this.logError('Falha definitiva ao enviar mensagem.', lastError, {
       recipient: this.formatLogRecipient(chatId),
@@ -1842,22 +2305,65 @@ class WhatsAppService extends BaseService {
   // ===========================================================================
 
   async resetSession() {
-    if (this.isConnecting || this._initializePromise) {
+    if (this.isShuttingDown) {
       return {
         success: false,
-        message: 'Já existe uma operação de conexão em andamento.',
+        message: 'O serviço está a encerrar.',
       };
     }
 
-    this.isConnecting = true;
+    if (this._resetPromise) {
+      return this._resetPromise;
+    }
 
+    let trackedResetPromise;
+
+    trackedResetPromise = this._performSessionReset().finally(() => {
+      if (this._resetPromise === trackedResetPromise) {
+        this._resetPromise = null;
+      }
+    });
+
+    this._resetPromise = trackedResetPromise;
+
+    return trackedResetPromise;
+  }
+
+  async _performSessionReset() {
+    // Invalida imediatamente listeners/socket da geração anterior.
     this._lifecycleGeneration += 1;
+    const previousInitialize = this._initializePromise;
+
+    this.isConnecting = true;
+    this.isReady = false;
 
     try {
       this.clearRetryTimer();
       this.clearLogoutRestartTimer();
 
+      // Fechar primeiro impede que uma sessão antiga continue a receber
+      // eventos enquanto a nova autenticação está a ser preparada.
       await this.closeSocket();
+
+      // O initialize antigo pode ainda estar dentro de useMultiFileAuthState()
+      // ou fetchLatestBaileysVersion(). Aguarde-o antes de criar outro socket.
+      if (previousInitialize) {
+        try {
+          await previousInitialize;
+        } catch (error) {
+          this.logWarn(
+            'Inicialização anterior terminou com erro durante reset.',
+            { error: error?.message || String(error) }
+          );
+        }
+      }
+
+      if (this.isShuttingDown) {
+        return {
+          success: false,
+          message: 'O serviço está a encerrar.',
+        };
+      }
 
       this.resetConnectionState();
 
@@ -1875,9 +2381,10 @@ class WhatsAppService extends BaseService {
         };
       }
 
-      this.isConnecting = false;
-
-      const started = await this.initialize();
+      // Não chamar initialize() aqui: _resetPromise ainda está ativo e
+      // initialize() aguarda esse mesmo promise. Usamos a entrada privada
+      // que já está protegida pelo reset atual.
+      const started = await this._startInitialization();
 
       if (!started) {
         return {
@@ -1940,6 +2447,7 @@ class WhatsAppService extends BaseService {
     this.connectedAt = null;
 
     this.lastReadTimestamps.clear();
+    this._readReceiptInFlight.clear();
   }
 
   // ===========================================================================
@@ -1971,7 +2479,11 @@ class WhatsAppService extends BaseService {
     this.qrCode = null;
     this.connectedAt = null;
 
-    metrics.whatsappConnected.set(0);
+    this._safeMetricSet(
+      metrics.whatsappConnected,
+      0,
+      'whatsappConnected'
+    );
 
     this.log('Shutdown do WhatsApp iniciado.');
 
@@ -1982,10 +2494,21 @@ class WhatsAppService extends BaseService {
       // Best-effort.
     }
 
+    // Invalida listeners imediatamente; operações antigas verão
+    // isShuttingDown/lifecycleGeneration e deixam de criar novo socket.
     const socket = this.socket;
 
     this.socket = null;
     this._socketGeneration += 1;
+
+    const inFlightLifecycle = [
+      this._initializePromise,
+      this._resetPromise,
+    ].filter(Boolean);
+
+    if (inFlightLifecycle.length) {
+      await Promise.allSettled(inFlightLifecycle);
+    }
 
     try {
       if (socket) {
@@ -2004,6 +2527,8 @@ class WhatsAppService extends BaseService {
 
     this._clearLidCache();
     this.lastReadTimestamps.clear();
+    this._readReceiptInFlight.clear();
+    this._conversationResetLocks.clear();
 
     this.log('Shutdown do WhatsApp concluído.');
   }
