@@ -1,1198 +1,781 @@
 // src/services/redis.service.js
 //
-// Cliente Redis central do Yane Bot.
+// Camada de acesso ao Redis para coordenação do serviço WhatsApp.
 //
-// Responsabilidades:
-//   - lifecycle e reconexão do Redis;
-//   - operações básicas;
-//   - mapping telefone ↔ entrevista;
-//   - mapping persistente LID ↔ PN;
-//   - deduplicação de mensagens;
-//   - locks distribuídos por telefone;
-//   - rate limiting;
-//   - filas de turnos;
-//   - dead-letter.
+// RESPONSABILIDADES
+// -----------------
+//   - conexão resiliente (reconnect com backoff e limite);
+//   - namespacing consistente (`prefix:part:part`);
+//   - mapeamento telefone ↔ entrevista (TTL longo);
+//   - mapeamento LID ↔ PN (TTL longo);
+//   - dedupe de mensagens recebidas (SET NX);
+//   - locks distribuídos por telefone (SET NX PX + refresh);
+//   - fila pendente por telefone (LIST + ZSET);
+//   - dead-letter (LIST);
+//   - rate limit por bucket (INCR + EXPIRE);
+//   - cache de routing resolvido (TTL curto);
+//   - estado de disambiguação (TTL curto).
 //
-// Princípios:
-//   - Redis pode falhar sem derrubar o processo;
-//   - locks são validados e renovados atomicamente;
-//   - eventos de clientes antigos nunca podem corromper o estado
-//     do cliente actualmente activo;
-//   - operações críticas usam scripts Lua quando necessário;
-//   - logs Redis são informativos, mas não devem inundar stdout.
+// [FIX-REDIS-1]
+//   Métodos de routing adicionados para suportar o
+//   InterviewService v9.3:
+//     - getDisambiguation / setDisambiguation / clearDisambiguation
+//     - getResolvedInterview / rememberResolvedInterview /
+//       clearResolvedInterview
 //
-// [FIX-1] Mapping persistente LID ↔ PN.
-//         TTL longo porque o mapping é relativamente estável.
+// [FIX-REDIS-2]
+//   Operações críticas (enqueue, reschedule, move-to-dead-letter,
+//   release-lock, refresh-lock) executam via Lua para garantir
+//   atomicidade entre LIST e ZSET.
 //
-// [FIX-2] LOCK_TTL = 300s.
-//         O processamento de um turno pode ultrapassar 90s em
-//         cenários normais. O lock é renovado periodicamente.
+// [FIX-REDIS-3]
+//   isAvailable() baseado no estado real do cliente ioredis
+//   ('ready'), não em flags manuais.
 //
-// [FIX-3] refreshLock() usa Lua para fazer GET + EXPIRE
-//         atomicamente. Evita race conditions.
-//
-// [FIX-4] Eventos do Redis são associados ao client correcto.
-//         Um client antigo em processo de shutdown nunca consegue
-//         marcar o novo client como indisponível.
-//
-// [FIX-5] withPhoneLock() renova automaticamente o lock.
-//         O consumidor não precisa implementar heartbeat manual.
-//
+// PRINCÍPIOS
+// - Nenhuma operação lança para o caller se o Redis estiver em baixo;
+//   devolvem valores neutros e registam erro.
+// - TTLs explícitos em todas as chaves efémeras.
+// - Namespacing configurável via REDIS_PREFIX (default: 'yane').
+
+'use strict';
 
 const Redis = require('ioredis');
-const crypto = require('crypto');
+const pino = require('pino');
 
-// ============================================================
+// =============================================================================
 // CONFIGURAÇÃO
-// ============================================================
+// =============================================================================
 
-const DEFAULT_URL = 'redis://localhost:6379';
-const DEFAULT_KEY_PREFIX = 'yane';
+const DEFAULT_PREFIX = 'yane';
+const DEFAULT_URL = 'redis://127.0.0.1:6379';
 
-const PHONE_MAP_TTL = 2 * 60 * 60; // 2 horas
-const DEDUPE_TTL = 5 * 60; // 5 minutos
+const DEFAULT_TTLS = Object.freeze({
+  // Mapeamento telefone → entrevista activa. Longo porque não é
+  // efémero — a entrevista dura dias.
+  interviewMapping: 7 * 24 * 60 * 60,
 
-const LOCK_TTL = 300; // 5 minutos
+  // Mapeamento LID → PN. Longo, para não perder histórico.
+  lidMapping: 30 * 24 * 60 * 60,
 
-// Renovação suficientemente frequente para manter uma margem
-// confortável dentro do TTL de 300s.
-const LOCK_RENEW_INTERVAL_MS = 30_000;
+  // Dedupe de mensagens recebidas. 24h cobre qualquer retry
+  // razoável do WhatsApp/Baileys.
+  messageSeen: 24 * 60 * 60,
 
-const RATE_WINDOW = 1; // 1 segundo
-const CONNECT_TIMEOUT = 5000;
+  // Cache de routing resolvido. Curto para evitar stale após
+  // uma nova entrevista ser criada para o mesmo telefone.
+  resolvedInterview: 5 * 60,
 
-const LID_MAP_TTL = 30 * 24 * 60 * 60; // 30 dias
+  // Estado de disambiguação. Curto — a escolha do candidato
+  // deve acontecer em minutos, não horas.
+  disambiguation: 5 * 60,
 
-const ERROR_LOG_COOLDOWN_MS = 10_000;
+  // Rate limit bucket. 1 segundo é o que o WhatsApp espera.
+  rateWindow: 1,
 
+  // Lock distribuído. Renovado pelo InterviewService a cada 30s.
+  lock: 300,
+});
+
+const MAX_RETRY_ATTEMPTS = 30;
+const RETRY_BASE_MS = 200;
+const RETRY_MAX_MS = 3_000;
+
+// =============================================================================
+// LUA SCRIPTS
+// =============================================================================
+
+// Enfileira um item se a fila não estiver cheia.
+// Retorna 1 em sucesso, 0 se cheia.
+const ENQUEUE_SCRIPT = `
+local queueKey = KEYS[1]
+local phonesKey = KEYS[2]
+
+local phone = ARGV[1]
+local payload = ARGV[2]
+local score = tonumber(ARGV[3])
+local maxItems = tonumber(ARGV[4])
+
+local len = redis.call('LLEN', queueKey)
+if len >= maxItems then
+  return 0
+end
+
+redis.call('LPUSH', queueKey, payload)
+redis.call('ZADD', phonesKey, score, phone)
+return 1
+`;
+
+// Substitui o item do topo da fila por uma versão atualizada
+// (mesmo turno, nova tentativa) e reagenda o telefone.
+// Retorna 1 em sucesso, 0 se a fila está vazia.
+const RESCHEDULE_SCRIPT = `
+local queueKey = KEYS[1]
+local phonesKey = KEYS[2]
+
+local phone = ARGV[1]
+local newPayload = ARGV[2]
+local newScore = tonumber(ARGV[3])
+
+local len = redis.call('LLEN', queueKey)
+if len == 0 then
+  return 0
+end
+
+redis.call('LSET', queueKey, -1, newPayload)
+redis.call('ZADD', phonesKey, newScore, phone)
+return 1
+`;
+
+// Move o item do topo da fila para a dead-letter e limpa
+// o telefone do schedule se ficar vazio.
+const DEAD_LETTER_SCRIPT = `
+local queueKey = KEYS[1]
+local phonesKey = KEYS[2]
+local deadKey = KEYS[3]
+
+local phone = ARGV[1]
+local deadPayload = ARGV[2]
+
+local item = redis.call('RPOP', queueKey)
+if not item then
+  return 0
+end
+
+redis.call('LPUSH', deadKey, deadPayload)
+
+if redis.call('LLEN', queueKey) == 0 then
+  redis.call('ZREM', phonesKey, phone)
+end
+
+return 1
+`;
+
+// Release do lock — só se o token bater certo.
 const RELEASE_LOCK_SCRIPT = `
-  if redis.call('GET', KEYS[1]) == ARGV[1] then
-    return redis.call('DEL', KEYS[1])
-  end
-
-  return 0
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
 `;
 
+// Refresh do lock — só se o token bater certo.
 const REFRESH_LOCK_SCRIPT = `
-  if redis.call('GET', KEYS[1]) == ARGV[1] then
-    return redis.call('EXPIRE', KEYS[1], ARGV[2])
-  end
-
-  return 0
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
 `;
+
+// Rate limit por janela fixa. INCR + EXPIRE atómico.
+const RATE_LIMIT_SCRIPT = `
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local windowSeconds = tonumber(ARGV[2])
+
+local current = redis.call('INCR', key)
+if current == 1 then
+  redis.call('EXPIRE', key, windowSeconds)
+end
+
+if current > limit then
+  return 0
+end
+return 1
+`;
+
+// =============================================================================
+// SERVIÇO
+// =============================================================================
 
 class RedisService {
-  constructor() {
-    // Client Redis actualmente activo.
+  constructor(options = {}) {
+    this.prefix = String(
+      options.prefix || process.env.REDIS_PREFIX || DEFAULT_PREFIX
+    );
+
+    this.url = String(
+      options.url || process.env.REDIS_URL || DEFAULT_URL
+    );
+
+    this.logger =
+      options.logger ||
+      pino({
+        level: process.env.LOG_LEVEL || 'info',
+        base: { service: 'redis' },
+      });
+
     this.client = null;
+    this._initialized = false;
+    this._initializing = null;
+    this._closing = false;
 
-    // Estado exposto ao restante da aplicação.
-    this.isReady = false;
-
-    // Evita inicializações concorrentes.
-    this.initializing = null;
-
-    // Evita múltiplos refresh simultâneos do mesmo lock.
-    this._lockRefreshInFlight = new Set();
-
-    // Rate-limit de logs de erros.
-    this._lastErrorLog = new Map();
-
-    this.prefix =
-      process.env.REDIS_PREFIX || DEFAULT_KEY_PREFIX;
-
-    this.url =
-      process.env.REDIS_URL || DEFAULT_URL;
+    // Scripts via defineCommand para aproveitar EVALSHA.
+    this._scripts = null;
   }
 
-  // ============================================================
-  // CICLO DE VIDA
-  // ============================================================
+  // ===========================================================================
+  // LOGGING
+  // ===========================================================================
+
+  _log(level, message, context = {}) {
+    try {
+      const method = this.logger?.[level];
+      if (typeof method === 'function') {
+        method.call(this.logger, context, message);
+      }
+    } catch (_) {
+      // Logging best-effort.
+    }
+  }
+
+  log(message, context = {}) {
+    this._log('info', message, context);
+  }
+
+  logWarn(message, context = {}) {
+    this._log('warn', message, context);
+  }
+
+  logError(message, error = null, context = {}) {
+    const safe = { ...context };
+
+    if (error) {
+      safe.error = error?.message || String(error);
+      safe.code = error?.code || null;
+    }
+
+    this._log('error', message, safe);
+  }
+
+  // ===========================================================================
+  // LIFECYCLE
+  // ===========================================================================
 
   async initialize() {
-    if (this.isReady && this.client) {
-      return;
-    }
+    if (this._initialized && !this._closing) return true;
+    if (this._initializing) return this._initializing;
 
-    if (this.initializing) {
-      return this.initializing;
-    }
-
-    this.initializing = this._initialize();
+    this._closing = false;
+    this._initializing = this._initializeInternal();
 
     try {
-      await this.initializing;
+      return await this._initializing;
     } finally {
-      this.initializing = null;
+      this._initializing = null;
     }
   }
 
-  async _initialize() {
-    const previousClient = this.client;
-
-    if (previousClient) {
-      try {
-        previousClient.disconnect();
-      } catch (_) {
-        // Best effort.
-      }
-    }
-
-    this.client = null;
-    this.isReady = false;
+  async _initializeInternal() {
+    if (this.client) return true;
 
     const client = new Redis(this.url, {
-      maxRetriesPerRequest: 3,
-      enableReadyCheck: true,
       lazyConnect: false,
-      connectTimeout: CONNECT_TIMEOUT,
+      maxRetriesPerRequest: null,
+      enableReadyCheck: true,
+      enableOfflineQueue: true,
+      keyPrefix: '',
+      retryStrategy: (times) => {
+        if (times > MAX_RETRY_ATTEMPTS) {
+          this.logError(
+            `Redis desistiu após ${MAX_RETRY_ATTEMPTS} tentativas.`
+          );
+          return null;
+        }
 
-      retryStrategy: (times) =>
-        Math.min(times * 200, 3000),
+        const delay = Math.min(
+          RETRY_BASE_MS * Math.pow(1.5, times - 1),
+          RETRY_MAX_MS
+        );
+
+        const jitter = 0.8 + Math.random() * 0.4;
+        return Math.round(delay * jitter);
+      },
+      reconnectOnError: (error) => {
+        const message = String(error?.message || '');
+        return message.includes('READONLY');
+      },
     });
 
     this.client = client;
 
-    this._attachClientEvents(client);
-
-    try {
-      await this._waitForReady(client);
-    } catch (error) {
-      if (this.client === client) {
-        this.client = null;
-        this.isReady = false;
-      }
-
-      try {
-        client.disconnect();
-      } catch (_) {
-        // Best effort.
-      }
-
-      throw error;
-    }
-  }
-
-  _attachClientEvents(client) {
     client.on('ready', () => {
-      // Um client antigo nunca pode alterar o estado
-      // do client que o substituiu.
-      if (this.client !== client) {
-        return;
-      }
-
-      this.isReady = true;
-
-      console.log('[REDIS] Pronto.');
+      this.log('Redis pronto.');
     });
 
     client.on('error', (error) => {
-      if (this.client !== client) {
-        return;
-      }
-
-      this.isReady = false;
-
-      this._logError(
-        'connection',
-        '[REDIS] Erro:',
-        error
-      );
+      this.logError('Erro de Redis.', error);
     });
 
     client.on('close', () => {
-      if (this.client !== client) {
-        return;
-      }
+      this.logWarn('Conexão Redis fechada.');
+    });
 
-      this.isReady = false;
+    client.on('reconnecting', (delay) => {
+      this.logWarn('Redis a reconectar.', { delayMs: delay });
     });
 
     client.on('end', () => {
-      if (this.client !== client) {
-        return;
-      }
-
-      this.isReady = false;
+      this.logWarn('Conexão Redis terminada.');
     });
 
-    client.on('reconnecting', () => {
-      if (this.client !== client) {
-        return;
-      }
+    // Espera pela primeira ligação. Se não chegar em 10s, falha.
+    try {
+      await this._waitForReady(client, 10_000);
+    } catch (error) {
+      this.logError(
+        'Redis não ficou pronto dentro do timeout inicial.',
+        error
+      );
 
-      this.isReady = false;
+      // Não fechamos o cliente — a reconexão continua em background.
+      // O caller decide se continua ou não.
+      throw error;
+    }
+
+    this._defineScripts(client);
+
+    this._initialized = true;
+
+    this.log('RedisService inicializado.', {
+      url: this._maskUrl(this.url),
+      prefix: this.prefix,
     });
+
+    return true;
   }
 
-  async _waitForReady(client) {
+  _waitForReady(client, timeoutMs) {
     return new Promise((resolve, reject) => {
-      let settled = false;
+      if (client.status === 'ready') {
+        resolve();
+        return;
+      }
 
-      const timeout = setTimeout(() => {
-        finishReject(
-          new Error('Redis timeout na ligação inicial.')
-        );
-      }, CONNECT_TIMEOUT);
-
-      const cleanup = () => {
-        clearTimeout(timeout);
-
-        client.removeListener(
-          'ready',
-          onReady
-        );
-
-        client.removeListener(
-          'end',
-          onEnd
-        );
-      };
-
-      const finishResolve = () => {
-        if (settled) {
-          return;
-        }
-
-        settled = true;
+      const onReady = () => {
         cleanup();
         resolve();
       };
 
-      const finishReject = (error) => {
-        if (settled) {
-          return;
-        }
-
-        settled = true;
+      const onError = (error) => {
         cleanup();
         reject(error);
       };
 
-      const onReady = () => {
-        finishResolve();
-      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('redis_ready_timeout'));
+      }, timeoutMs);
 
-      const onEnd = () => {
-        finishReject(
-          new Error('Redis encerrou a ligação inicial.')
-        );
+      const cleanup = () => {
+        clearTimeout(timer);
+        client.removeListener('ready', onReady);
+        client.removeListener('error', onError);
       };
 
       client.once('ready', onReady);
-      client.once('end', onEnd);
-
-      // Pode já ter atingido ready entre a criação do
-      // client e a instalação dos listeners.
-      if (
-        this.client === client &&
-        client.status === 'ready'
-      ) {
-        finishResolve();
-      }
+      client.once('error', onError);
     });
   }
 
+  _defineScripts(client) {
+    this._scripts = {
+      enqueue: client.defineCommand('yaneEnqueue', {
+        numberOfKeys: 2,
+        lua: ENQUEUE_SCRIPT,
+      }),
+      reschedule: client.defineCommand('yaneReschedule', {
+        numberOfKeys: 2,
+        lua: RESCHEDULE_SCRIPT,
+      }),
+      deadLetter: client.defineCommand('yaneDeadLetter', {
+        numberOfKeys: 3,
+        lua: DEAD_LETTER_SCRIPT,
+      }),
+      releaseLock: client.defineCommand('yaneReleaseLock', {
+        numberOfKeys: 1,
+        lua: RELEASE_LOCK_SCRIPT,
+      }),
+      refreshLock: client.defineCommand('yaneRefreshLock', {
+        numberOfKeys: 1,
+        lua: REFRESH_LOCK_SCRIPT,
+      }),
+      rateLimit: client.defineCommand('yaneRateLimit', {
+        numberOfKeys: 1,
+        lua: RATE_LIMIT_SCRIPT,
+      }),
+    };
+  }
+
   async close() {
+    if (this._closing) return;
+    this._closing = true;
+
     const client = this.client;
-
-    if (!client) {
-      this.isReady = false;
-      return;
-    }
-
-    // Invalida imediatamente o client para que eventos tardios
-    // não alterem o estado da aplicação.
     this.client = null;
-    this.isReady = false;
+    this._initialized = false;
+    this._scripts = null;
+
+    if (!client) return;
 
     try {
       await client.quit();
     } catch (error) {
+      this.logWarn('Falha no QUIT do Redis; forçando disconnect.', {
+        error: error?.message,
+      });
+
       try {
         client.disconnect();
       } catch (_) {
-        // Best effort.
+        // Best-effort.
       }
     }
+
+    this.log('RedisService encerrado.');
   }
 
-  // ============================================================
-  // HELPERS INTERNOS
-  // ============================================================
-
-  _available() {
-    return Boolean(
-      this.client &&
-      this.isReady &&
-      this.client.status === 'ready'
-    );
-  }
+  // ===========================================================================
+  // ESTADO
+  // ===========================================================================
 
   isAvailable() {
-    return this._available();
-  }
-
-  async _execute(operation, fallback, fn) {
-    if (!this._available()) {
-      return fallback;
-    }
-
-    const client = this.client;
-
-    try {
-      return await fn(client);
-    } catch (error) {
-      this._logError(
-        operation,
-        `[REDIS] ${operation} falhou:`,
-        error
-      );
-
-      return fallback;
-    }
-  }
-
-  _logError(operation, prefix, error) {
-    const message =
-      error?.message ||
-      String(error);
-
-    const now = Date.now();
-    const last = this._lastErrorLog.get(operation) || 0;
-
-    // Evita inundação dos logs durante uma indisponibilidade
-    // prolongada do Redis.
-    if (
-      now - last <
-      ERROR_LOG_COOLDOWN_MS
-    ) {
-      return;
-    }
-
-    this._lastErrorLog.set(
-      operation,
-      now
-    );
-
-    try {
-      console.error(
-        prefix,
-        message
-      );
-    } catch (_) {
-      // Logging é best effort.
-    }
-  }
-
-  _normalizeTtl(ttlSeconds) {
-    if (
-      ttlSeconds === null ||
-      ttlSeconds === undefined
-    ) {
-      return null;
-    }
-
-    const ttl = Number(ttlSeconds);
-
-    if (!Number.isFinite(ttl) || ttl <= 0) {
-      return null;
-    }
-
-    return Math.max(
-      1,
-      Math.floor(ttl)
+    return Boolean(
+      this.client && this.client.status === 'ready'
     );
   }
 
-  // ============================================================
-  // CHAVES
-  // ============================================================
+  // ===========================================================================
+  // NAMESPACING
+  // ===========================================================================
 
+  /**
+   * Junta as partes com `:` e prefixa com o namespace.
+   *   key('msg', 'abc')          → 'yane:msg:abc'
+   *   key('pending:turn', phone) → 'yane:pending:turn:258841234567'
+   *   key('pending:phones')      → 'yane:pending:phones'
+   */
   key(...parts) {
-    return [
-      this.prefix,
-      ...parts,
-    ]
-      .filter(
-        (part) =>
-          part !== undefined &&
-          part !== null &&
-          part !== ''
-      )
-      .map((part) => String(part))
-      .join(':');
+    const clean = parts
+      .filter((p) => p !== undefined && p !== null && String(p).length > 0)
+      .map((p) => String(p));
+
+    if (!clean.length) return this.prefix;
+    return `${this.prefix}:${clean.join(':')}`;
   }
 
-  // ============================================================
-  // OPERAÇÕES BÁSICAS
-  // ============================================================
+  _maskUrl(url) {
+    try {
+      const parsed = new URL(url);
+      if (parsed.password) parsed.password = '***';
+      return parsed.toString();
+    } catch (_) {
+      return url;
+    }
+  }
+
+  // ===========================================================================
+  // OPERAÇÕES GENÉRICAS
+  // ===========================================================================
 
   async get(key) {
-    return this._execute(
-      'GET',
-      null,
-      (client) =>
-        client.get(key)
-    );
+    try {
+      return await this.client.get(key);
+    } catch (error) {
+      this.logError('Redis GET falhou.', error, { key: this._safeKey(key) });
+      return null;
+    }
   }
 
-  async set(
-    key,
-    value,
-    ttlSeconds = null
-  ) {
-    return this._execute(
-      'SET',
-      false,
-      async (client) => {
-        const ttl =
-          this._normalizeTtl(
-            ttlSeconds
-          );
-
-        if (ttl !== null) {
-          await client.set(
-            key,
-            value,
-            'EX',
-            ttl
-          );
-        } else {
-          await client.set(
-            key,
-            value
-          );
-        }
-
-        return true;
+  async set(key, value, ttlSeconds = null) {
+    try {
+      if (ttlSeconds) {
+        await this.client.set(key, value, 'EX', ttlSeconds);
+      } else {
+        await this.client.set(key, value);
       }
-    );
+      return true;
+    } catch (error) {
+      this.logError('Redis SET falhou.', error, { key: this._safeKey(key) });
+      return false;
+    }
   }
 
   async del(key) {
-    return this._execute(
-      'DEL',
-      false,
-      async (client) => {
-        await client.del(key);
-        return true;
-      }
-    );
-  }
-
-  async setnx(
-    key,
-    value,
-    ttlSeconds = null
-  ) {
-    return this._execute(
-      'SETNX',
-      false,
-      async (client) => {
-        const ttl =
-          this._normalizeTtl(
-            ttlSeconds
-          );
-
-        const result =
-          ttl !== null
-            ? await client.set(
-                key,
-                value,
-                'EX',
-                ttl,
-                'NX'
-              )
-            : await client.set(
-                key,
-                value,
-                'NX'
-              );
-
-        return result === 'OK';
-      }
-    );
-  }
-
-  async incr(
-    key,
-    ttlSeconds = null
-  ) {
-    return this._execute(
-      'INCR',
-      0,
-      async (client) => {
-        const value =
-          await client.incr(key);
-
-        const ttl =
-          this._normalizeTtl(
-            ttlSeconds
-          );
-
-        if (
-          value === 1 &&
-          ttl !== null
-        ) {
-          await client.expire(
-            key,
-            ttl
-          );
-        }
-
-        return value;
-      }
-    );
-  }
-
-  // ============================================================
-  // LISTAS
-  // ============================================================
-
-  async lpush(key, value) {
-    return this._execute(
-      'LPUSH',
-      false,
-      async (client) => {
-        await client.lpush(
-          key,
-          value
-        );
-
-        return true;
-      }
-    );
-  }
-
-  async lpop(key) {
-    return this._execute(
-      'LPOP',
-      null,
-      (client) =>
-        client.lpop(key)
-    );
-  }
-
-  async rpop(key) {
-    return this._execute(
-      'RPOP',
-      null,
-      (client) =>
-        client.rpop(key)
-    );
-  }
-
-  async lindex(
-    key,
-    index = 0
-  ) {
-    return this._execute(
-      'LINDEX',
-      null,
-      (client) =>
-        client.lindex(
-          key,
-          index
-        )
-    );
+    try {
+      const removed = await this.client.del(key);
+      return Number(removed) > 0;
+    } catch (error) {
+      this.logError('Redis DEL falhou.', error, { key: this._safeKey(key) });
+      return false;
+    }
   }
 
   async llen(key) {
-    return this._execute(
-      'LLEN',
-      0,
-      (client) =>
-        client.llen(key)
-    );
+    try {
+      const value = await this.client.llen(key);
+      return Number(value) || 0;
+    } catch (error) {
+      this.logError('Redis LLEN falhou.', error, { key: this._safeKey(key) });
+      return 0;
+    }
   }
 
-  async lset(
-    key,
-    index,
-    value
-  ) {
-    return this._execute(
-      'LSET',
-      false,
-      async (client) => {
-        await client.lset(
-          key,
-          index,
-          value
-        );
-
-        return true;
-      }
-    );
+  async lindex(key, index) {
+    try {
+      return await this.client.lindex(key, index);
+    } catch (error) {
+      this.logError('Redis LINDEX falhou.', error, { key: this._safeKey(key) });
+      return null;
+    }
   }
 
-  // ============================================================
-  // SORTED SETS
-  // ============================================================
-
-  async zadd(
-    key,
-    score,
-    member
-  ) {
-    return this._execute(
-      'ZADD',
-      false,
-      async (client) => {
-        await client.zadd(
-          key,
-          score,
-          member
-        );
-
-        return true;
-      }
-    );
+  async rpop(key) {
+    try {
+      return await this.client.rpop(key);
+    } catch (error) {
+      this.logError('Redis RPOP falhou.', error, { key: this._safeKey(key) });
+      return null;
+    }
   }
 
-  async zrem(
-    key,
-    member
-  ) {
-    return this._execute(
-      'ZREM',
-      false,
-      async (client) => {
-        await client.zrem(
-          key,
-          member
-        );
-
-        return true;
-      }
-    );
-  }
-
-  async zrangeByScore(
-    key,
-    min,
-    max,
-    offset = 0,
-    count = 10
-  ) {
-    return this._execute(
-      'ZRANGEBYSCORE',
-      [],
-      (client) =>
-        client.zrangebyscore(
-          key,
-          min,
-          max,
-          'LIMIT',
-          offset,
-          count
-        )
-    );
-  }
-
-  // ============================================================
-  // PHONE ↔ INTERVIEW
-  // ============================================================
-
-  async rememberInterview(
-    phone,
-    interviewId,
-    ttl = PHONE_MAP_TTL
-  ) {
-    if (!phone || !interviewId) {
+  async zrem(key, member) {
+    try {
+      const removed = await this.client.zrem(key, member);
+      return Number(removed) > 0;
+    } catch (error) {
+      this.logError('Redis ZREM falhou.', error, { key: this._safeKey(key) });
       return false;
     }
+  }
 
+  async zrangeByScore(key, min, max, offset = 0, count = 20) {
+    try {
+      return await this.client.zrangebyscore(
+        key,
+        min,
+        max,
+        'LIMIT',
+        offset,
+        count
+      );
+    } catch (error) {
+      this.logError(
+        'Redis ZRANGEBYSCORE falhou.',
+        error,
+        { key: this._safeKey(key) }
+      );
+      return [];
+    }
+  }
+
+  _safeKey(key) {
+    // Não expor PII (telefones) nos logs de erro.
+    const raw = String(key || '');
+    if (raw.length <= 40) return raw;
+    return `${raw.slice(0, 20)}...${raw.slice(-10)}`;
+  }
+
+  // ===========================================================================
+  // MAPEAMENTO TELEFONE ↔ ENTREVISTA
+  // ===========================================================================
+
+  async rememberInterview(phone, interviewId) {
+    if (!phone || !interviewId) return false;
+
+    const key = this.key('interview', phone);
     return this.set(
-      this.key(
-        'phone',
-        phone
-      ),
+      key,
       String(interviewId),
-      ttl
+      DEFAULT_TTLS.interviewMapping
     );
   }
 
-  async resolveInterviewId(
-    phone
-  ) {
-    if (!phone) {
-      return null;
-    }
+  async resolveInterviewId(phone) {
+    if (!phone) return null;
 
-    return this.get(
-      this.key(
-        'phone',
-        phone
-      )
-    );
+    const key = this.key('interview', phone);
+    return this.get(key);
   }
 
-  async forgetInterview(
-    phone
-  ) {
-    if (!phone) {
-      return false;
-    }
+  async forgetInterview(phone) {
+    if (!phone) return false;
 
-    return this.del(
-      this.key(
-        'phone',
-        phone
-      )
-    );
+    const key = this.key('interview', phone);
+    return this.del(key);
   }
 
-  // ============================================================
-  // LID ↔ PHONE
-  // ============================================================
+  // ===========================================================================
+  // MAPEAMENTO LID ↔ PHONE
+  // ===========================================================================
 
-  _normalizeLidKey(lidJid) {
-    const value =
-      String(lidJid || '').trim();
+  async rememberLidMapping(lidJid, phone) {
+    if (!lidJid || !phone) return false;
 
-    if (!value) {
-      return '';
-    }
-
-    const local =
-      value
-        .split('@')[0]
-        .split(':')[0]
-        .trim();
-
-    return local;
+    const key = this.key('lid', lidJid);
+    return this.set(key, String(phone), DEFAULT_TTLS.lidMapping);
   }
 
-  async rememberLidMapping(
-    lidJid,
-    phone,
-    ttl = LID_MAP_TTL
-  ) {
-    const local =
-      this._normalizeLidKey(
-        lidJid
+  async resolveLidMapping(lidJid) {
+    if (!lidJid) return null;
+
+    const key = this.key('lid', lidJid);
+    return this.get(key);
+  }
+
+  async forgetLidMapping(lidJid) {
+    if (!lidJid) return false;
+
+    const key = this.key('lid', lidJid);
+    return this.del(key);
+  }
+
+  // ===========================================================================
+  // DEDUPE DE MENSAGENS
+  // ===========================================================================
+
+  /**
+   * Marca uma mensagem como vista. Devolve `true` se for a primeira
+   * vez (nova) e `false` se já tinha sido marcada (duplicada).
+   */
+  async markMessageSeen(messageId) {
+    if (!messageId) return true;
+
+    const key = this.key('msg', messageId);
+
+    try {
+      const result = await this.client.set(
+        key,
+        '1',
+        'EX',
+        DEFAULT_TTLS.messageSeen,
+        'NX'
       );
 
-    if (!local || !phone) {
-      return false;
-    }
+      return result === 'OK';
+    } catch (error) {
+      this.logError('Redis SET NX falhou (dedupe).', error, {
+        key: this._safeKey(key),
+      });
 
-    return this.set(
-      this.key(
-        'lid',
-        local
-      ),
-      String(phone),
-      ttl
-    );
-  }
-
-  async resolveLidMapping(
-    lidJid
-  ) {
-    const local =
-      this._normalizeLidKey(
-        lidJid
-      );
-
-    if (!local) {
-      return null;
-    }
-
-    return this.get(
-      this.key(
-        'lid',
-        local
-      )
-    );
-  }
-
-  async forgetLidMapping(
-    lidJid
-  ) {
-    const local =
-      this._normalizeLidKey(
-        lidJid
-      );
-
-    if (!local) {
-      return false;
-    }
-
-    return this.del(
-      this.key(
-        'lid',
-        local
-      )
-    );
-  }
-
-  // ============================================================
-  // DEDUPE
-  // ============================================================
-
-  async markMessageSeen(
-    messageId,
-    ttl = DEDUPE_TTL
-  ) {
-    if (!messageId) {
+      // Em caso de erro, assumimos que é nova. Preferimos processar
+      // duplicado a descartar uma mensagem legítima.
       return true;
     }
-
-    // true = mensagem nova marcada;
-    // false = já existia ou Redis indisponível.
-    return this.setnx(
-      this.key(
-        'msg',
-        messageId
-      ),
-      '1',
-      ttl
-    );
   }
 
-  // ============================================================
-  // LOCK POR TELEFONE
-  // ============================================================
+  // ===========================================================================
+  // LOCKS DISTRIBUÍDOS
+  // ===========================================================================
 
-  _createLockToken() {
-    return [
-      Date.now().toString(36),
-      crypto
-        .randomBytes(16)
-        .toString('hex'),
-    ].join('-');
-  }
+  /**
+   * Adquire um lock para um recurso (por norma, telefone).
+   * Devolve o token se sucesso, `null` se já está bloqueado.
+   */
+  async acquireLock(resource, ttlSeconds = DEFAULT_TTLS.lock) {
+    if (!resource) return null;
 
-  async acquireLock(
-    phone,
-    ttl = LOCK_TTL
-  ) {
-    if (!phone) {
-      return null;
-    }
+    const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const key = this.key('lock', resource);
 
-    const key =
-      this.key(
-        'lock',
-        phone
-      );
-
-    const token =
-      this._createLockToken();
-
-    const acquired =
-      await this.setnx(
+    try {
+      const result = await this.client.set(
         key,
         token,
-        ttl
+        'EX',
+        ttlSeconds,
+        'NX'
       );
 
-    return acquired
-      ? token
-      : null;
-  }
-
-  async releaseLock(
-    phone,
-    token
-  ) {
-    if (
-      !phone ||
-      !token ||
-      !this._available()
-    ) {
-      return false;
-    }
-
-    const client =
-      this.client;
-
-    const key =
-      this.key(
-        'lock',
-        phone
-      );
-
-    try {
-      const result =
-        await client.eval(
-          RELEASE_LOCK_SCRIPT,
-          1,
-          key,
-          token
-        );
-
-      return Number(result) === 1;
+      return result === 'OK' ? token : null;
     } catch (error) {
-      this._logError(
-        'release-lock',
-        '[REDIS] RELEASE LOCK falhou:',
-        error
-      );
+      this.logError('Redis SET NX falhou (lock).', error, {
+        key: this._safeKey(key),
+      });
 
-      return false;
-    }
-  }
-
-  async refreshLock(
-    phone,
-    token,
-    ttl = LOCK_TTL
-  ) {
-    if (
-      !phone ||
-      !token ||
-      !this._available()
-    ) {
-      return false;
-    }
-
-    const normalizedTtl =
-      this._normalizeTtl(ttl);
-
-    if (normalizedTtl === null) {
-      return false;
-    }
-
-    const key =
-      this.key(
-        'lock',
-        phone
-      );
-
-    const client =
-      this.client;
-
-    try {
-      // GET + EXPIRE acontece atomicamente.
-      const result =
-        await client.eval(
-          REFRESH_LOCK_SCRIPT,
-          1,
-          key,
-          token,
-          normalizedTtl
-        );
-
-      return Number(result) === 1;
-    } catch (error) {
-      this._logError(
-        'refresh-lock',
-        '[REDIS] REFRESH LOCK falhou:',
-        error
-      );
-
-      return false;
-    }
-  }
-
-  // ============================================================
-  // LOCK COM HEARTBEAT
-  // ============================================================
-
-  async withPhoneLock(
-    phone,
-    fn,
-    options = {}
-  ) {
-    const ttl =
-      this._normalizeTtl(
-        options.ttl ??
-          LOCK_TTL
-      ) || LOCK_TTL;
-
-    const renewInterval =
-      Math.max(
-        1000,
-        Number(
-          options.renewIntervalMs ??
-            LOCK_RENEW_INTERVAL_MS
-        ) || LOCK_RENEW_INTERVAL_MS
-      );
-
-    const token =
-      await this.acquireLock(
-        phone,
-        ttl
-      );
-
-    if (!token) {
       return null;
     }
+  }
 
-    let stopped = false;
-    let refreshRunning = false;
+  async releaseLock(resource, token) {
+    if (!resource || !token || !this._scripts) return false;
 
-    const heartbeat = setInterval(
-      async () => {
-        if (
-          stopped ||
-          refreshRunning
-        ) {
-          return;
-        }
-
-        refreshRunning = true;
-
-        try {
-          const refreshed =
-            await this.refreshLock(
-              phone,
-              token,
-              ttl
-            );
-
-          if (!refreshed) {
-            this._logError(
-              `lock-lost:${phone}`,
-              `[REDIS] Lock perdido para ${phone}:`,
-              new Error(
-                'refreshLock() não confirmou a posse do lock'
-              )
-            );
-          }
-        } finally {
-          refreshRunning = false;
-        }
-      },
-      renewInterval
-    );
-
-    if (
-      typeof heartbeat.unref ===
-      'function'
-    ) {
-      heartbeat.unref();
-    }
+    const key = this.key('lock', resource);
 
     try {
-      return await fn();
-    } finally {
-      stopped = true;
+      const result = await this._scripts.releaseLock(key, token);
+      return Number(result) === 1;
+    } catch (error) {
+      this.logError('Redis release-lock falhou.', error, {
+        key: this._safeKey(key),
+      });
 
-      clearInterval(
-        heartbeat
-      );
-
-      await this.releaseLock(
-        phone,
-        token
-      );
-    }
-  }
-
-  // ============================================================
-  // RATE LIMIT
-  // ============================================================
-
-  async allowRate(
-    bucket = 'out',
-    maxPerSecond = 60
-  ) {
-    if (
-      !Number.isFinite(
-        maxPerSecond
-      ) ||
-      maxPerSecond <= 0
-    ) {
       return false;
     }
-
-    const second =
-      Math.floor(
-        Date.now() / 1000
-      );
-
-    const key =
-      this.key(
-        'rate',
-        bucket,
-        second
-      );
-
-    const count =
-      await this.incr(
-        key,
-        RATE_WINDOW + 1
-      );
-
-    return count <= maxPerSecond;
   }
 
-  // ============================================================
-  // FILA DE TURNOS PENDENTES
-  // ============================================================
+  async refreshLock(resource, token, ttlSeconds = DEFAULT_TTLS.lock) {
+    if (!resource || !token || !this._scripts) return false;
 
+    const key = this.key('lock', resource);
+    const ttlMs = Math.max(1_000, Number(ttlSeconds) * 1000);
+
+    try {
+      const result = await this._scripts.refreshLock(key, token, ttlMs);
+      return Number(result) === 1;
+    } catch (error) {
+      this.logError('Redis refresh-lock falhou.', error, {
+        key: this._safeKey(key),
+      });
+
+      return false;
+    }
+  }
+
+  // ===========================================================================
+  // FILA PENDENTE
+  // ===========================================================================
+
+  /**
+   * Enfileira um item para um telefone.
+   * Devolve 1 em sucesso, 0 se a fila estiver cheia, -1 em erro.
+   */
   async enqueuePendingItem({
     queueKey,
     phonesKey,
     phone,
     payload,
     score,
-    maxItems,
+    maxItems = 20,
   }) {
-    if (
-      !this._available() ||
-      !queueKey ||
-      !phonesKey ||
-      !phone ||
-      maxItems <= 0
-    ) {
-      return 0;
+    if (!queueKey || !phonesKey || !phone || !payload || !this._scripts) {
+      return -1;
     }
 
-    const script = `
-      local len =
-        redis.call('LLEN', KEYS[1])
-
-      if len >= tonumber(ARGV[1]) then
-        return 0
-      end
-
-      redis.call(
-        'LPUSH',
-        KEYS[1],
-        ARGV[2]
-      )
-
-      redis.call(
-        'ZADD',
-        KEYS[2],
-        ARGV[3],
-        ARGV[4]
-      )
-
-      return 1
-    `;
-
     try {
-      const result =
-        await this.client.eval(
-          script,
-          2,
-          queueKey,
-          phonesKey,
-          String(maxItems),
-          String(payload ?? ''),
-          String(score),
-          String(phone)
-        );
-
-      return Number(result) || 0;
-    } catch (error) {
-      this._logError(
-        'enqueue-pending',
-        '[REDIS] enqueuePendingItem falhou:',
-        error
+      const result = await this._scripts.enqueue(
+        queueKey,
+        phonesKey,
+        phone,
+        payload,
+        String(score || Date.now()),
+        String(maxItems)
       );
 
-      return 0;
+      return Number(result);
+    } catch (error) {
+      this.logError('Redis enqueue falhou.', error, {
+        queueKey: this._safeKey(queueKey),
+      });
+
+      return -1;
     }
   }
 
+  /**
+   * Substitui o item do topo da fila por uma versão atualizada e
+   * reagenda o telefone. Devolve `true` em sucesso.
+   */
   async reschedulePendingItem({
     queueKey,
     phonesKey,
@@ -1200,61 +783,33 @@ class RedisService {
     payload,
     score,
   }) {
-    if (
-      !this._available() ||
-      !queueKey ||
-      !phonesKey ||
-      !phone
-    ) {
+    if (!queueKey || !phonesKey || !phone || !payload || !this._scripts) {
       return false;
     }
 
-    const script = `
-      if redis.call('LLEN', KEYS[1]) == 0 then
-        return 0
-      end
-
-      redis.call(
-        'LSET',
-        KEYS[1],
-        -1,
-        ARGV[1]
-      )
-
-      redis.call(
-        'ZADD',
-        KEYS[2],
-        ARGV[2],
-        ARGV[3]
-      )
-
-      return 1
-    `;
-
     try {
-      const result =
-        await this.client.eval(
-          script,
-          2,
-          queueKey,
-          phonesKey,
-          String(payload ?? ''),
-          String(score),
-          String(phone)
-        );
+      const result = await this._scripts.reschedule(
+        queueKey,
+        phonesKey,
+        phone,
+        payload,
+        String(score || Date.now())
+      );
 
       return Number(result) === 1;
     } catch (error) {
-      this._logError(
-        'reschedule-pending',
-        '[REDIS] reschedulePendingItem falhou:',
-        error
-      );
+      this.logError('Redis reschedule falhou.', error, {
+        queueKey: this._safeKey(queueKey),
+      });
 
       return false;
     }
   }
 
+  /**
+   * Move o item do topo da fila para a dead-letter. Devolve `true`
+   * em sucesso.
+   */
   async movePendingToDeadLetter({
     queueKey,
     phonesKey,
@@ -1262,79 +817,145 @@ class RedisService {
     phone,
     payload,
   }) {
-    if (
-      !this._available() ||
-      !queueKey ||
-      !phonesKey ||
-      !deadKey ||
-      !phone
-    ) {
+    if (!queueKey || !phonesKey || !deadKey || !phone || !this._scripts) {
       return false;
     }
 
-    const script = `
-      local item =
-        redis.call(
-          'RPOP',
-          KEYS[1]
-        )
-
-      if not item then
-        return 0
-      end
-
-      local deadItem =
-        ARGV[1]
-
-      if not deadItem or deadItem == '' then
-        deadItem = item
-      end
-
-      redis.call(
-        'LPUSH',
-        KEYS[3],
-        deadItem
-      )
-
-      local remaining =
-        redis.call(
-          'LLEN',
-          KEYS[1]
-        )
-
-      if remaining == 0 then
-        redis.call(
-          'ZREM',
-          KEYS[2],
-          ARGV[2]
-        )
-      end
-
-      return 1
-    `;
-
     try {
-      const result =
-        await this.client.eval(
-          script,
-          3,
-          queueKey,
-          phonesKey,
-          deadKey,
-          String(payload ?? ''),
-          String(phone)
-        );
+      const result = await this._scripts.deadLetter(
+        queueKey,
+        phonesKey,
+        deadKey,
+        phone,
+        payload
+      );
 
       return Number(result) === 1;
     } catch (error) {
-      this._logError(
-        'dead-letter',
-        '[REDIS] movePendingToDeadLetter falhou:',
-        error
-      );
+      this.logError('Redis dead-letter falhou.', error, {
+        queueKey: this._safeKey(queueKey),
+      });
 
       return false;
     }
+  }
+
+  // ===========================================================================
+  // RATE LIMIT
+  // ===========================================================================
+
+  /**
+   * Consome 1 do bucket. Devolve `true` se permitido, `false` se
+   * excedeu o limite na janela actual.
+   */
+  async allowRate(bucket, limit, windowSeconds = DEFAULT_TTLS.rateWindow) {
+    if (!bucket || !this._scripts) return false;
+
+    const key = this.key('rate', bucket);
+
+    try {
+      const result = await this._scripts.rateLimit(
+        key,
+        String(limit),
+        String(windowSeconds)
+      );
+
+      return Number(result) === 1;
+    } catch (error) {
+      this.logError('Redis rate-limit falhou.', error, {
+        key: this._safeKey(key),
+      });
+
+      // Fail-open: se o rate limiter está em baixo, permitimos.
+      // Bloquear envios por um erro de Redis seria pior.
+      return true;
+    }
+  }
+
+  // ===========================================================================
+  // [FIX-REDIS-1] CACHE DE ROUTING RESOLVIDO
+  // ===========================================================================
+
+  async rememberResolvedInterview(
+    phone,
+    interviewId,
+    ttlSeconds = DEFAULT_TTLS.resolvedInterview
+  ) {
+    if (!phone || !interviewId) return false;
+
+    const key = this.key('resolved', phone);
+    return this.set(key, String(interviewId), ttlSeconds);
+  }
+
+  async getResolvedInterview(phone) {
+    if (!phone) return null;
+
+    const key = this.key('resolved', phone);
+    return this.get(key);
+  }
+
+  async clearResolvedInterview(phone) {
+    if (!phone) return false;
+
+    const key = this.key('resolved', phone);
+    return this.del(key);
+  }
+
+  // ===========================================================================
+  // [FIX-REDIS-1] ESTADO DE DISAMBIGUAÇÃO
+  // ===========================================================================
+
+  async setDisambiguation(
+    phone,
+    state,
+    ttlSeconds = DEFAULT_TTLS.disambiguation
+  ) {
+    if (!phone || !state) return false;
+
+    const key = this.key('disamb', phone);
+
+    let serialized;
+    try {
+      serialized = JSON.stringify(state);
+    } catch (error) {
+      this.logError('Falha ao serializar estado de disambiguação.', error, {
+        phone,
+      });
+
+      return false;
+    }
+
+    return this.set(key, serialized, ttlSeconds);
+  }
+
+  async getDisambiguation(phone) {
+    if (!phone) return null;
+
+    const key = this.key('disamb', phone);
+    const raw = await this.get(key);
+
+    if (!raw) return null;
+
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      this.logError(
+        'Falha ao deserializar estado de disambiguação.',
+        error,
+        { phone }
+      );
+
+      // Estado corrompido — limpamos para não ficar preso.
+      await this.clearDisambiguation(phone);
+      return null;
+    }
+  }
+
+  async clearDisambiguation(phone) {
+    if (!phone) return false;
+
+    const key = this.key('disamb', phone);
+    return this.del(key);
   }
 }
 

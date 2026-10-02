@@ -4,32 +4,31 @@
 //
 // [FIXES]
 // [FIX-1] PII (phone, remoteJid, preview) mascarada nos logs.
-// [FIX-2] LID ↔ PN com persistência Redis. Quando enviamos uma
-//         mensagem, o Baileys devolve o JID real associado. Se for
-//         um LID, guardamos a associação no Redis. Nas respostas
-//         seguintes, o LID é resolvido em O(1) sem depender do
-//         signalRepository.
-// [FIX-3] normalizePhone aceita números internacionais (8-15
-//         dígitos) sem prefixar 258 por engano.
-// [FIX-4] Mensagens com LID não resolvível são reportadas como
-//         órfãs ao backend em vez de descartadas silenciosamente.
+// [FIX-2] LID ↔ PN com persistência Redis.
+// [FIX-3] normalizePhone aceita números internacionais.
+// [FIX-4] Mensagens com LID não resolvível são reportadas como órfãs.
+// [FIX-2.5] handleConnectionClose distingue loggedOut / replaced / transitório.
+// [FIX-2.6] extractMessageContent reconhece mensagens de mídia.
 //
-// [FIX-2.5] handleConnectionClose distingue três casos:
-//           - loggedOut (401): limpar credenciais, novo QR
-//           - connectionReplaced (440): NÃO retentar. Outro
-//             dispositivo assumiu a sessão. Retentar é inútil e
-//             cria loop. Operador tem de agir.
-//           - resto: backoff normal
+// [FIX-ROUTING-1]
+//   extractMessageContent passa a devolver `repliedToMessageId`,
+//   extraído de `contextInfo.stanzaId`. É o ID da mensagem do
+//   convite a que o candidato respondeu com reply-to. Alimenta o
+//   passo 1 do resolver no backend — o caminho mais fiável para
+//   identificar a entrevista quando o telefone tem múltiplas.
 //
-// [FIX-2.6] extractMessageContent reconhece mensagens de mídia
-//           (imagem, áudio, vídeo, documento, sticker). Antes eram
-//           descartadas silenciosamente — o candidato ficava sem
-//           resposta sem perceber porquê.
+// [FIX-ROUTING-2]
+//   contextInfo é extraído de todos os tipos de mensagem que o
+//   podem transportar (texto, mídia). O Baileys coloca o
+//   contextInfo no wrapper do tipo concreto, não no topo.
+//
+// [FIX-ROUTING-3]
+//   processIncomingMessage e handleMessage propagam o
+//   repliedToMessageId até interviewService.handleIncomingMessage.
 //
 // PRINCÍPIOS
 // - Uma única instância do socket por número.
 // - O processamento de negócio continua no InterviewService.
-// - Redis continua responsável pela coordenação/rate limit externo.
 // - Nunca enviar para LID não resolvido.
 
 const {
@@ -89,13 +88,8 @@ const GROUP_SUFFIX = '@g.us';
 const LID_SUFFIX = '@lid';
 const NEWSLETTER_SUFFIX = '@newsletter';
 
-// [FIX-2.5] código do WhatsApp para "sessão substituída por outro
-// dispositivo". Não usar DisconnectReason.connectionReplaced
-// directamente porque a constante pode não existir em versões mais
-// antigas do Baileys.
 const STATUS_CONNECTION_REPLACED = 440;
 
-// [FIX-2.6] mensagens de mídia que reconhecemos mas não processamos.
 const MEDIA_MESSAGE_TYPES = [
   'imageMessage',
   'videoMessage',
@@ -261,8 +255,6 @@ class WhatsAppService extends BaseService {
 
     this.connectedAt = null;
 
-    // Promises de lifecycle impedem initialize/reset concorrentes de criarem
-    // sockets sobrepostos ou deixarem operações antigas mutarem o estado atual.
     this._initializePromise = null;
     this._resetPromise = null;
     this._lifecycleGeneration = 0;
@@ -278,7 +270,6 @@ class WhatsAppService extends BaseService {
     this.lastReadTimestamps = new Map();
     this._readReceiptInFlight = new Set();
 
-    // Evita duas operações de !reset simultâneas para o mesmo candidato.
     this._conversationResetLocks = new Map();
 
     this._lidToPhoneCache = new Map();
@@ -432,8 +423,6 @@ class WhatsAppService extends BaseService {
 
       return businessSettled ? businessResult : instrumentedResult;
     } catch (error) {
-      // Se o callback de negócio já foi executado, não transformamos uma
-      // falha da instrumentação em falha do envio/processamento.
       if (businessError) {
         throw businessError;
       }
@@ -718,8 +707,6 @@ class WhatsAppService extends BaseService {
     }
 
     try {
-      // Use o socket associado ao evento. this.socket pode já apontar
-      // para uma nova geração quando esta operação assíncrona terminar.
       const mapping = socket?.signalRepository?.lidMapping;
 
       if (
@@ -839,8 +826,6 @@ class WhatsAppService extends BaseService {
   async initialize() {
     if (this.isShuttingDown) return false;
 
-    // Um reset invalida a sessão anterior. Quem pedir initialize durante
-    // esse período aguarda a operação e usa o socket que ficar vigente.
     if (this._resetPromise) {
       try {
         await this._resetPromise;
@@ -973,9 +958,7 @@ class WhatsAppService extends BaseService {
           } else {
             socket.ws?.close?.();
           }
-        } catch (_) {
-          // Best-effort.
-        }
+        } catch (_) {}
 
         return false;
       }
@@ -1005,9 +988,6 @@ class WhatsAppService extends BaseService {
 
       this.logError('Erro ao inicializar WhatsApp.', error);
 
-      // Uma inicialização antiga pode terminar depois de um reset/shutdown.
-      // Nunca deixe essa operação antiga agendar um reconnect por cima da
-      // geração atual.
       if (
         ownsLifecycle &&
         !this.isShuttingDown
@@ -1138,7 +1118,6 @@ class WhatsAppService extends BaseService {
     });
   }
 
-  // [FIX-2.5] três casos distintos.
   async handleConnectionClose(
     lastDisconnect,
     socket = this.socket,
@@ -1166,7 +1145,6 @@ class WhatsAppService extends BaseService {
       statusCode: statusCode || 'unknown',
     });
 
-    // Caso 1: sessão explicitamente encerrada pelo WhatsApp.
     if (statusCode === DisconnectReason.loggedOut) {
       this.log(
         'Sessão encerrada pelo WhatsApp. Limpando credenciais '
@@ -1180,8 +1158,6 @@ class WhatsAppService extends BaseService {
       return;
     }
 
-    // [FIX-2.5] Caso 2: outro dispositivo assumiu a sessão.
-    // Retentar é inútil — só re-autenticação manual resolve.
     if (statusCode === STATUS_CONNECTION_REPLACED) {
       this.logError(
         'Sessão substituída por outro dispositivo. '
@@ -1196,11 +1172,9 @@ class WhatsAppService extends BaseService {
         'errorsTotal'
       );
 
-      // Não chamar scheduleReconnect. Operador tem de agir.
       return;
     }
 
-    // Caso 3: queda transitória — backoff normal.
     if (this.isShuttingDown) return;
 
     this.scheduleReconnect();
@@ -1353,8 +1327,6 @@ class WhatsAppService extends BaseService {
       : [];
 
     for (const message of messages) {
-      // O listener do Baileys permanece livre; cada mensagem é tratada
-      // de forma independente e nunca bloqueia a entrega dos próximos eventos.
       void this.processIncomingMessage(
         message,
         socket,
@@ -1397,8 +1369,6 @@ class WhatsAppService extends BaseService {
       msg.key?.participantAlt ||
       null;
 
-    // Nunca use this.socket aqui: durante uma reconexão ele pode já ser
-    // uma geração diferente da que originou o evento.
     const phone = await this.resolveJidToPhone(
       rawJid,
       altJid,
@@ -1461,6 +1431,7 @@ class WhatsAppService extends BaseService {
       type,
       textLength: parsed.text ? parsed.text.length : 0,
       mediaType: parsed.mediaType || null,
+      hasReplyTo: Boolean(parsed.repliedToMessageId),
     });
 
     await this.handleMessage(
@@ -1471,6 +1442,8 @@ class WhatsAppService extends BaseService {
       {
         isMedia: parsed.isMedia,
         mediaType: parsed.mediaType,
+        // [FIX-ROUTING-3] Propagado até ao InterviewService.
+        repliedToMessageId: parsed.repliedToMessageId,
       }
     );
   }
@@ -1509,19 +1482,52 @@ class WhatsAppService extends BaseService {
   // EXTRAÇÃO
   // ===========================================================================
 
+  /**
+   * Extrai texto, flags e o reply-to de uma mensagem Baileys.
+   *
+   * [FIX-ROUTING-1] Devolve sempre `repliedToMessageId` — o
+   * `stanzaId` da mensagem original quando o candidato faz
+   * reply-to. É o ID que guardámos no backend em
+   * `state.invite_message_id` no momento do convite.
+   *
+   * [FIX-ROUTING-2] O `contextInfo` pode vir em vários wrappers
+   * (extendedTextMessage, imageMessage, etc). Extraímos de todos
+   * para não perder o reply-to em mensagens de mídia com legenda.
+   */
   extractMessageContent(msg) {
     if (!msg?.message) {
-      return { text: '', isButtonClick: false, isMedia: false };
+      return {
+        text: '',
+        isButtonClick: false,
+        isMedia: false,
+        repliedToMessageId: null,
+      };
     }
 
     const message =
       normalizeMessageContent(msg.message) || msg.message;
+
+    // [FIX-ROUTING-2] O contextInfo vive no wrapper concreto.
+    const contextInfo =
+      message.extendedTextMessage?.contextInfo ||
+      message.imageMessage?.contextInfo ||
+      message.videoMessage?.contextInfo ||
+      message.audioMessage?.contextInfo ||
+      message.documentMessage?.contextInfo ||
+      message.stickerMessage?.contextInfo ||
+      null;
+
+    // [FIX-ROUTING-1] stanzaId é o ID Baileys da mensagem original.
+    const repliedToMessageId = contextInfo?.stanzaId
+      ? String(contextInfo.stanzaId).trim() || null
+      : null;
 
     if (message.conversation) {
       return {
         text: String(message.conversation).trim(),
         isButtonClick: false,
         isMedia: false,
+        repliedToMessageId,
       };
     }
 
@@ -1530,13 +1536,19 @@ class WhatsAppService extends BaseService {
         text: String(message.extendedTextMessage.text).trim(),
         isButtonClick: false,
         isMedia: false,
+        repliedToMessageId,
       };
     }
 
     if (message.interactiveResponseMessage) {
-      return this.extractInteractiveResponse(
+      const interactive = this.extractInteractiveResponse(
         message.interactiveResponseMessage
       );
+
+      return {
+        ...interactive,
+        repliedToMessageId,
+      };
     }
 
     if (message.buttonsResponseMessage) {
@@ -1550,6 +1562,7 @@ class WhatsAppService extends BaseService {
         ).trim(),
         isButtonClick: true,
         isMedia: false,
+        repliedToMessageId,
       };
     }
 
@@ -1564,6 +1577,7 @@ class WhatsAppService extends BaseService {
         ).trim(),
         isButtonClick: true,
         isMedia: false,
+        repliedToMessageId,
       };
     }
 
@@ -1578,12 +1592,10 @@ class WhatsAppService extends BaseService {
         ).trim(),
         isButtonClick: true,
         isMedia: false,
+        repliedToMessageId,
       };
     }
 
-    // Mídia é sinalizada explicitamente. O texto fica vazio quando não
-    // existe legenda, permitindo que handleMessage execute a resposta
-    // específica para ficheiros em vez de tratar o placeholder como texto.
     for (const mediaType of MEDIA_MESSAGE_TYPES) {
       const media = message[mediaType];
 
@@ -1593,11 +1605,17 @@ class WhatsAppService extends BaseService {
           isButtonClick: false,
           isMedia: true,
           mediaType,
+          repliedToMessageId,
         };
       }
     }
 
-    return { text: '', isButtonClick: false, isMedia: false };
+    return {
+      text: '',
+      isButtonClick: false,
+      isMedia: false,
+      repliedToMessageId,
+    };
   }
 
   extractInteractiveResponse(response) {
@@ -1676,8 +1694,6 @@ class WhatsAppService extends BaseService {
 
     const normalizedText = String(text || '').trim();
 
-    // Mídia sem legenda precisa chegar aqui com text vazio. Isso evita
-    // confundir a indicação de mídia com uma mensagem textual.
     if (options.isMedia && !normalizedText) {
       await this.sendMessage(
         from,
@@ -1714,6 +1730,8 @@ class WhatsAppService extends BaseService {
           isButton,
           isMedia: Boolean(options.isMedia),
           mediaType: options.mediaType || null,
+          // [FIX-ROUTING-3] Propaga o reply-to.
+          repliedToMessageId: options.repliedToMessageId || null,
         }
       );
     } catch (error) {
@@ -1758,8 +1776,6 @@ class WhatsAppService extends BaseService {
     let interviewId = null;
 
     try {
-      // [FIX-2.7] Resolver PRIMEIRO. O estado local não pode ser apagado
-      // antes de descobrir qual entrevista deve ser cancelada no backend.
       if (
         typeof this.interviewService.resolveInterviewId === 'function'
       ) {
@@ -1784,7 +1800,6 @@ class WhatsAppService extends BaseService {
         );
       }
 
-      // Só depois da sincronização com o backend limpamos o estado local.
       if (
         typeof this.interviewService.forgetInterview !== 'function'
       ) {
@@ -1794,6 +1809,20 @@ class WhatsAppService extends BaseService {
       }
 
       await this.interviewService.forgetInterview(from);
+
+      // [FIX-ROUTING] Limpar também o cache local de routing
+      // para que o próximo turno volte a resolver do zero.
+      if (
+        typeof this.interviewService._clearResolvedInterview === 'function'
+      ) {
+        await this.interviewService._clearResolvedInterview(from);
+      }
+
+      if (
+        typeof this.interviewService._clearDisambiguationState === 'function'
+      ) {
+        await this.interviewService._clearDisambiguationState(from);
+      }
 
       this.log('Reset de conversa concluído.', {
         phone: from,
@@ -1808,9 +1837,6 @@ class WhatsAppService extends BaseService {
         error: error?.message || String(error),
       });
 
-      // Importante: não apagamos o estado local se o cancelamento backend
-      // de uma entrevista existente falhar. Isso evita deixar Redis e backend
-      // em estados divergentes.
       return false;
     }
   }
@@ -1850,8 +1876,6 @@ class WhatsAppService extends BaseService {
 
       if (!key?.remoteJid || !key?.id) continue;
 
-      // Read receipt é best-effort. Não aguardamos o backend dentro da fila
-      // de updates do Baileys, evitando que um request lento atrase os demais.
       void this.handleReadReceipt(
         key,
         socket,
@@ -2330,7 +2354,6 @@ class WhatsAppService extends BaseService {
   }
 
   async _performSessionReset() {
-    // Invalida imediatamente listeners/socket da geração anterior.
     this._lifecycleGeneration += 1;
     const previousInitialize = this._initializePromise;
 
@@ -2341,12 +2364,8 @@ class WhatsAppService extends BaseService {
       this.clearRetryTimer();
       this.clearLogoutRestartTimer();
 
-      // Fechar primeiro impede que uma sessão antiga continue a receber
-      // eventos enquanto a nova autenticação está a ser preparada.
       await this.closeSocket();
 
-      // O initialize antigo pode ainda estar dentro de useMultiFileAuthState()
-      // ou fetchLatestBaileysVersion(). Aguarde-o antes de criar outro socket.
       if (previousInitialize) {
         try {
           await previousInitialize;
@@ -2381,9 +2400,6 @@ class WhatsAppService extends BaseService {
         };
       }
 
-      // Não chamar initialize() aqui: _resetPromise ainda está ativo e
-      // initialize() aguarda esse mesmo promise. Usamos a entrada privada
-      // que já está protegida pelo reset atual.
       const started = await this._startInitialization();
 
       if (!started) {
@@ -2490,12 +2506,8 @@ class WhatsAppService extends BaseService {
     try {
       process.removeListener('SIGTERM', this._boundShutdown);
       process.removeListener('SIGINT', this._boundShutdown);
-    } catch (_) {
-      // Best-effort.
-    }
+    } catch (_) {}
 
-    // Invalida listeners imediatamente; operações antigas verão
-    // isShuttingDown/lifecycleGeneration e deixam de criar novo socket.
     const socket = this.socket;
 
     this.socket = null;
