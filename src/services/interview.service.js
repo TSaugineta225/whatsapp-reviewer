@@ -22,26 +22,41 @@
 // [FIX-ROUTING-1]
 //   _resolveInterviewForIncoming passa a delegar ao
 //   yane.resolveInboundMessage(). O antigo findActiveInterviewByPhone
-//   devolvia sempre a entrevista mais recente e, quando o mesmo
-//   telefone tinha duas entrevistas activas, o turno ia para a
-//   errada sem que ninguém soubesse.
+//   devolvia sempre a entrevista mais recente.
 //
 // [FIX-ROUTING-2]
-//   Disambiguação em estado de sessão (Redis + TTL 5min). Quando
-//   o backend devolve confidence=ambiguous, o bot guarda os
-//   candidatos e pergunta ao candidato. A resposta numérica é
-//   resolvida localmente sem voltar a chamar o backend.
+//   Disambiguação em estado de sessão (Redis + TTL 5min).
 //
 // [FIX-ROUTING-3]
-//   replied_to_message_id propagado em todo o pipeline. O Baileys
-//   entrega o ID da mensagem original do convite em
-//   contextInfo.stanzaId; esse ID alimenta o passo 1 do resolver
-//   (reply_to), que é o caminho mais fiável.
+//   replied_to_message_id propagado em todo o pipeline.
 //
 // [FIX-ROUTING-4]
-//   Cache local `resolved:<phone>` com TTL 5min. Depois de o
-//   backend confirmar uma entrevista para o telefone, evitamos
-//   re-resolver em cada turno consecutivo do mesmo candidato.
+//   Cache local `resolved:<phone>` com TTL 5min.
+//
+// [FIX-HONESTY-1]  <<< NOVO >>>
+//   startInterview deixa de devolver success:true quando o convite
+//   nem foi enviado nem enfileirado. O backend Python só verifica
+//   `success`, por isso mentir aqui causava entrevistas registadas
+//   como "convite enviado" que o candidato nunca recebeu.
+//   Campo novo: `delivered` / `queued` / `delivery_pending` para o
+//   backend distinguir os três estados.
+//
+// [FIX-ROUTING-LOCAL]  <<< NOVO >>>
+//   _resolveInterviewForIncoming volta a consultar o mapping local
+//   (`interview:<phone>`) ANTES de tentar o backend. Este atalho é
+//   O(1), foi escrito pelo próprio startInterview, e é a diferença
+//   entre o bot responder ou não ao candidato. A versão anterior
+//   tinha-o perdido — só consultava a cache `resolved:<phone>`,
+//   que nada preenche durante o convite.
+//
+// [FIX-BOOT-DIAG]  <<< NOVO >>>
+//   _initialize avisa explicitamente quando o InterviewService arranca
+//   sem WhatsAppService ligado. Sem este aviso, os convites ficavam
+//   silenciosamente em fila sem que ninguém percebesse.
+//
+// [FIX-CAP-3]  <<< NOVO >>>
+//   _assertYaneCapabilities valida também `cancelInterview`, porque o
+//   WhatsAppService o usa no !reset do candidato.
 
 'use strict';
 
@@ -93,21 +108,18 @@ const CONFIG = Object.freeze({
 
   bubblePauseMs: 300,
 
-  // [FIX-ROUTING-2] TTL da sessão de disambiguação.
   disambiguationTtlSeconds: 5 * 60,
-  // [FIX-ROUTING-4] TTL do cache local de entrevista resolvida.
   resolvedInterviewTtlSeconds: 5 * 60,
 });
 
-// [FIX-CAP-1] Métodos que o YaneIntegrationService tem de
-// expor para o InterviewService funcionar. Validados no boot.
 const REQUIRED_YANE_METHODS = Object.freeze([
   'sendInterviewTurn',
-  'findActiveInterviewByPhone',   // mantido para compatibilidade
-  'resolveInboundMessage',        // [FIX-ROUTING-1] novo
+  'findActiveInterviewByPhone',
+  'resolveInboundMessage',
   'reportUnmatchedIncoming',
   'sendMessageStatus',
   'healthCheck',
+  'cancelInterview',
 ]);
 
 // =============================================================================
@@ -218,7 +230,6 @@ class InterviewService {
     this._workerRunning = false;
     this._workerPromise = null;
 
-    // [FIX-CAP-1] Flag para evitar repetir o aviso de capacidades.
     this._yaneCapabilitiesChecked = false;
 
     this._fallbackSentAt = new Map();
@@ -238,7 +249,6 @@ class InterviewService {
     try {
       const method = this.logger?.[level];
       if (typeof method !== 'function') return;
-
       method.call(this.logger, context, message);
     } catch (_) {
       // Logging é best-effort.
@@ -251,10 +261,7 @@ class InterviewService {
 
     for (const [key, value] of Object.entries(extra)) {
       if (value === undefined || value === null) continue;
-
-      if (key === 'preview' || key === 'message' || key === 'body') {
-        continue;
-      }
+      if (key === 'preview' || key === 'message' || key === 'body') continue;
 
       if (key === 'remoteJid' || key === 'jid' || key === 'lid') {
         context[key] = maskIdentifier(value);
@@ -340,6 +347,23 @@ class InterviewService {
     await this.redis.initialize();
 
     if (this._isStaleLifecycle(generation)) return;
+
+    // [FIX-BOOT-DIAG] Aviso explícito se o WhatsAppService não estiver
+    // ligado. Sem isto, os convites caem silenciosamente em fila.
+    const wa = this._getWhatsAppService();
+    if (!wa) {
+      this.logWarn(
+        'InterviewService sem WhatsAppService ligado. ' +
+        'Chame interviewService.setWhatsAppService(whatsappService) ' +
+        'no arranque. Sem isto, os convites ficam em fila até o ' +
+        'WhatsApp estar pronto.'
+      );
+    } else if (!this._isWhatsAppReady(wa)) {
+      this.logWarn(
+        'WhatsAppService ligado mas ainda não pronto. ' +
+        'Convites ficarão em fila até a ligação abrir.'
+      );
+    }
 
     this._assertYaneCapabilities();
 
@@ -471,7 +495,7 @@ class InterviewService {
   }
 
   // ===========================================================================
-  // MAPEAMENTO PHONE ↔ INTERVIEW (compatibilidade)
+  // MAPEAMENTO PHONE ↔ INTERVIEW
   // ===========================================================================
 
   async rememberInterview(phone, interviewId) {
@@ -480,19 +504,13 @@ class InterviewService {
 
     try {
       return Boolean(
-        await this.redis.rememberInterview(
-          normalizedPhone,
-          interviewId
-        )
+        await this.redis.rememberInterview(normalizedPhone, interviewId)
       );
     } catch (error) {
       this.logError(
         'Falha ao guardar mapping telefone → entrevista.',
-        error,
-        normalizedPhone,
-        { interviewId }
+        error, normalizedPhone, { interviewId }
       );
-
       return false;
     }
   }
@@ -502,16 +520,12 @@ class InterviewService {
     if (!normalizedPhone) return null;
 
     try {
-      return (
-        (await this.redis.resolveInterviewId(normalizedPhone)) || null
-      );
+      return (await this.redis.resolveInterviewId(normalizedPhone)) || null;
     } catch (error) {
       this.logError(
         'Falha ao resolver entrevista por telefone.',
-        error,
-        normalizedPhone
+        error, normalizedPhone
       );
-
       return null;
     }
   }
@@ -521,16 +535,12 @@ class InterviewService {
     if (!normalizedPhone) return false;
 
     try {
-      return Boolean(
-        await this.redis.forgetInterview(normalizedPhone)
-      );
+      return Boolean(await this.redis.forgetInterview(normalizedPhone));
     } catch (error) {
       this.logError(
         'Falha ao remover mapping telefone → entrevista.',
-        error,
-        normalizedPhone
+        error, normalizedPhone
       );
-
       return false;
     }
   }
@@ -541,67 +551,36 @@ class InterviewService {
 
   async rememberLidMapping(lidJid, phone) {
     try {
-      if (typeof this.redis.rememberLidMapping !== 'function') {
-        return false;
-      }
-
-      return Boolean(
-        await this.redis.rememberLidMapping(lidJid, phone)
-      );
+      if (typeof this.redis.rememberLidMapping !== 'function') return false;
+      return Boolean(await this.redis.rememberLidMapping(lidJid, phone));
     } catch (error) {
-      this.logError(
-        'Falha ao persistir LID → PN.',
-        error,
-        phone,
-        { lid: lidJid }
-      );
-
+      this.logError('Falha ao persistir LID → PN.', error, phone, { lid: lidJid });
       return false;
     }
   }
 
   async resolveLidToPhone(lidJid) {
     try {
-      if (typeof this.redis.resolveLidMapping !== 'function') {
-        return null;
-      }
-
+      if (typeof this.redis.resolveLidMapping !== 'function') return null;
       return await this.redis.resolveLidMapping(lidJid);
     } catch (error) {
-      this.logError(
-        'Falha ao consultar LID no Redis.',
-        error,
-        null,
-        { lid: lidJid }
-      );
-
+      this.logError('Falha ao consultar LID no Redis.', error, null, { lid: lidJid });
       return null;
     }
   }
 
   async forgetLidMapping(lidJid) {
     try {
-      if (typeof this.redis.forgetLidMapping !== 'function') {
-        return false;
-      }
-
-      return Boolean(
-        await this.redis.forgetLidMapping(lidJid)
-      );
+      if (typeof this.redis.forgetLidMapping !== 'function') return false;
+      return Boolean(await this.redis.forgetLidMapping(lidJid));
     } catch (error) {
-      this.logError(
-        'Falha ao remover LID → PN.',
-        error,
-        null,
-        { lid: lidJid }
-      );
-
+      this.logError('Falha ao remover LID → PN.', error, null, { lid: lidJid });
       return false;
     }
   }
 
   // ===========================================================================
-  // [FIX-ROUTING-2/4] CACHE LOCAL DE ROUTING E DISAMBIGUAÇÃO
+  // CACHE LOCAL DE ROUTING E DISAMBIGUAÇÃO
   // ===========================================================================
 
   async _rememberResolvedInterview(phone, interviewId) {
@@ -611,17 +590,13 @@ class InterviewService {
     try {
       if (typeof this.redis.rememberResolvedInterview === 'function') {
         await this.redis.rememberResolvedInterview(
-          normalized,
-          interviewId,
-          CONFIG.resolvedInterviewTtlSeconds
+          normalized, interviewId, CONFIG.resolvedInterviewTtlSeconds
         );
       }
     } catch (error) {
-      this.logDebug(
-        'Falha ao guardar entrevista resolvida.',
-        normalized,
-        { error: errorMessage(error) }
-      );
+      this.logDebug('Falha ao guardar entrevista resolvida.', normalized, {
+        error: errorMessage(error),
+      });
     }
   }
 
@@ -630,20 +605,12 @@ class InterviewService {
     if (!normalized) return null;
 
     try {
-      if (typeof this.redis.getResolvedInterview !== 'function') {
-        return null;
-      }
-
-      return (
-        (await this.redis.getResolvedInterview(normalized)) || null
-      );
+      if (typeof this.redis.getResolvedInterview !== 'function') return null;
+      return (await this.redis.getResolvedInterview(normalized)) || null;
     } catch (error) {
-      this.logDebug(
-        'Falha ao ler entrevista resolvida.',
-        normalized,
-        { error: errorMessage(error) }
-      );
-
+      this.logDebug('Falha ao ler entrevista resolvida.', normalized, {
+        error: errorMessage(error),
+      });
       return null;
     }
   }
@@ -675,11 +642,7 @@ class InterviewService {
         );
       }
     } catch (error) {
-      this.logError(
-        'Falha ao guardar estado de disambiguação.',
-        error,
-        normalized
-      );
+      this.logError('Falha ao guardar estado de disambiguação.', error, normalized);
     }
   }
 
@@ -688,9 +651,7 @@ class InterviewService {
     if (!normalized) return null;
 
     try {
-      if (typeof this.redis.getDisambiguation !== 'function') {
-        return null;
-      }
+      if (typeof this.redis.getDisambiguation !== 'function') return null;
 
       const state = await this.redis.getDisambiguation(normalized);
       if (!state) return null;
@@ -702,12 +663,7 @@ class InterviewService {
 
       return state;
     } catch (error) {
-      this.logError(
-        'Falha ao ler estado de disambiguação.',
-        error,
-        normalized
-      );
-
+      this.logError('Falha ao ler estado de disambiguação.', error, normalized);
       return null;
     }
   }
@@ -735,9 +691,7 @@ class InterviewService {
     const index = Number(match[1]);
     if (!Number.isFinite(index)) return null;
 
-    return (
-      candidates.find((candidate) => candidate.index === index) || null
-    );
+    return candidates.find((candidate) => candidate.index === index) || null;
   }
 
   async _sendDisambiguationPrompt(phone, candidates, options = {}) {
@@ -745,8 +699,8 @@ class InterviewService {
 
     const header = retry
       ? 'Não percebi. Responde só com o número da opção (1, 2, ...).'
-      : 'Olá! Vejo que tens mais do que uma conversa aberta com a Yane.\n\n'
-        + 'Sobre qual queres falar agora?';
+      : 'Olá! Vejo que tens mais do que uma conversa aberta com a Yane.\n\n' +
+        'Sobre qual queres falar agora?';
 
     const lines = candidates
       .map((candidate) => {
@@ -760,17 +714,12 @@ class InterviewService {
       .join('\n');
 
     const body = `${header}\n\n${lines}`;
-
     const client = this._getWhatsAppService();
 
     try {
       await this._sendHumanBubble(phone, body, client);
     } catch (error) {
-      this.logError(
-        'Falha ao enviar prompt de disambiguação.',
-        error,
-        phone
-      );
+      this.logError('Falha ao enviar prompt de disambiguação.', error, phone);
     }
   }
 
@@ -778,55 +727,52 @@ class InterviewService {
   // INÍCIO DA ENTREVISTA
   // ===========================================================================
 
+  // [FIX-HONESTY-1] Devolve a verdade ao backend.
+  // `delivered` → mensagem saiu agora
+  // `queued`    → ficou em fila, worker entrega depois
+  // (nem um nem outro) → success:false
   async startInterview(payload = {}) {
     const phone = normalizePhone(payload.phone);
 
     const interviewId =
-      payload.interviewId ||
-      payload.interview_id ||
-      null;
+      payload.interviewId || payload.interview_id || null;
 
     const initialMessage = clean(
       payload.initialMessage || payload.initial_message
     );
 
     if (!phone || !interviewId || !initialMessage) {
-      this.logWarn(
-        'startInterview ignorado: payload inválido.',
-        phone,
-        {
-          interviewId,
-          hasMessage: Boolean(initialMessage),
-        }
-      );
-
+      this.logWarn('startInterview ignorado: payload inválido.', phone, {
+        interviewId,
+        hasMessage: Boolean(initialMessage),
+      });
       return { success: false, reason: 'invalid_payload' };
     }
 
-    const mapped = await this.rememberInterview(
-      phone,
-      interviewId
-    );
+    const mapped = await this.rememberInterview(phone, interviewId);
 
     if (!mapped) {
       this._metricIncrement('errorsTotal', { subsystem: 'redis' });
-
       return { success: false, reason: 'state_unavailable' };
     }
 
     this._metricIncrement('interviewsStarted');
 
     // Invalida qualquer cache de routing anterior — o candidato
-    // acabou de receber um novo convite e a próxima mensagem dele
-    // pode ir para esta entrevista nova.
+    // acabou de receber um novo convite.
     await this._clearResolvedInterview(phone);
 
     const delivery = await this._sendText(phone, initialMessage);
 
     if (delivery.ok) {
-      this.log('Convite enviado.', phone, { interviewId });
-
-      return { success: true, interviewId, phone };
+      this.log('Convite entregue.', phone, { interviewId });
+      return {
+        success: true,
+        interviewId,
+        phone,
+        delivered: true,
+        queued: false,
+      };
     }
 
     const queued = await this._enqueuePendingDelivery({
@@ -838,23 +784,39 @@ class InterviewService {
       interviewStatus: 'in_progress',
     });
 
-    if (queued === 1) {
-      this._metricIncrement('interviewsQueued');
-    } else {
+    if (queued !== 1) {
+      // Nem enviou nem enfileirou — dizer a verdade.
       this._metricIncrement('errorsTotal', { subsystem: 'redis' });
       await this._safeSendFallback(phone);
+
+      this.logError(
+        'Convite NÃO entregue e NÃO enfileirado.',
+        new Error('delivery_and_queue_failed'),
+        phone,
+        { interviewId, queued }
+      );
+
+      return {
+        success: false,
+        reason: 'delivery_and_queue_failed',
+        interviewId,
+        phone,
+      };
     }
 
-    this.logWarn('Convite não entregue.', phone, {
+    this._metricIncrement('interviewsQueued');
+
+    this.logWarn('Convite enfileirado (WhatsApp indisponível).', phone, {
       interviewId,
-      queued: queued === 1,
     });
 
     return {
       success: true,
       interviewId,
       phone,
-      queued: queued === 1,
+      delivered: false,
+      queued: true,
+      delivery_pending: true,
     };
   }
 
@@ -867,7 +829,6 @@ class InterviewService {
     const message = clean(text);
     const messageId = options.messageId || null;
     const isButton = Boolean(options.isButton);
-    // [FIX-ROUTING-3] reply-to extraído pelo whatsapp.service.js.
     const repliedToMessageId = options.repliedToMessageId || null;
 
     if (!phone || !message) {
@@ -902,7 +863,6 @@ class InterviewService {
 
     if (dedupeResult === 'unavailable') {
       await this._safeSendFallback(phone);
-
       return {
         handled: true,
         queued: false,
@@ -949,12 +909,7 @@ class InterviewService {
 
     if (queued === 1) {
       this._metricIncrement('turnsTotal', { status: 'queued' });
-
-      return {
-        handled: true,
-        queued: true,
-        reason: 'lock_busy',
-      };
+      return { handled: true, queued: true, reason: 'lock_busy' };
     }
 
     await this._forgetMessageSeen(messageId);
@@ -978,7 +933,6 @@ class InterviewService {
         this.logDebug('Mensagem duplicada ignorada.', phone, {
           msgId: messageId,
         });
-
         return 'duplicate';
       }
 
@@ -1018,12 +972,7 @@ class InterviewService {
 
       if (queued === 1) {
         this._metricIncrement('turnsTotal', { status: 'queued' });
-
-        return {
-          handled: true,
-          queued: true,
-          reason: 'pending_queue',
-        };
+        return { handled: true, queued: true, reason: 'pending_queue' };
       }
 
       await this._forgetMessageSeen(messageId);
@@ -1043,14 +992,8 @@ class InterviewService {
       { message, messageId, turnId, isButton, repliedToMessageId }
     );
 
-    // [FIX-ROUTING-2] Ambiguidade: prompt enviado, mensagem
-    // original NÃO é processada como turno. O próximo turno do
-    // candidato será interpretado como escolha.
     if (resolution.status === 'ambiguous') {
-      await this._sendDisambiguationPrompt(
-        phone,
-        resolution.candidates
-      );
+      await this._sendDisambiguationPrompt(phone, resolution.candidates);
 
       this._metricIncrement('turnsTotal', {
         status: 'disambiguation_prompted',
@@ -1065,9 +1008,7 @@ class InterviewService {
 
     if (resolution.status === 'disambiguation_invalid') {
       await this._sendDisambiguationPrompt(
-        phone,
-        resolution.candidates,
-        { retry: true }
+        phone, resolution.candidates, { retry: true }
       );
 
       this._metricIncrement('turnsTotal', {
@@ -1100,10 +1041,7 @@ class InterviewService {
 
       void this._reportOrphan({ phone, message, messageId });
 
-      return {
-        handled: false,
-        reason: 'no_active_interview',
-      };
+      return { handled: false, reason: 'no_active_interview' };
     }
 
     const interviewId = resolution.interviewId;
@@ -1121,17 +1059,13 @@ class InterviewService {
     } catch (error) {
       this._metricIncrement('errorsTotal', { subsystem: 'backend' });
 
-      this.logWarn(
-        'Backend indisponível — turno em fila.',
-        phone,
-        {
-          interviewId,
-          turnId,
-          msgId: messageId,
-          error: errorMessage(error),
-          retryable: isRetryableError(error),
-        }
-      );
+      this.logWarn('Backend indisponível — turno em fila.', phone, {
+        interviewId,
+        turnId,
+        msgId: messageId,
+        error: errorMessage(error),
+        retryable: isRetryableError(error),
+      });
 
       const queued = await this._queueIncomingTurn({
         phone,
@@ -1153,9 +1087,7 @@ class InterviewService {
         handled: true,
         queued: queued === 1,
         reason:
-          queued === 1
-            ? 'backend_unavailable'
-            : 'queue_unavailable',
+          queued === 1 ? 'backend_unavailable' : 'queue_unavailable',
       };
     }
 
@@ -1168,7 +1100,7 @@ class InterviewService {
   }
 
   // ===========================================================================
-  // [FIX-ROUTING-1/2/4] RESOLUÇÃO DE ENTREVISTA PARA MENSAGEM INBOUND
+  // [FIX-ROUTING-LOCAL] RESOLUÇÃO DE ENTREVISTA PARA MENSAGEM INBOUND
   // ===========================================================================
 
   async _resolveInterviewForIncoming(
@@ -1181,23 +1113,33 @@ class InterviewService {
       repliedToMessageId = null,
     }
   ) {
-    // 1) Disambiguação pendente tem prioridade ABSOLUTA.
-    //    Se estamos a meio de uma escolha, o texto do candidato
-    //    é interpretado como resposta, não como mensagem nova.
+    // 0) Atalho local — a chave escrita por startInterview.
+    //    É O(1), nunca falha se o mapping existe, e é a razão
+    //    pela qual o bot consegue responder imediatamente após o
+    //    convite. Sem isto, perdíamos a entrevista e caíamos no
+    //    backend, que podia não conhecer o mapping ainda.
+    const localId = await this.resolveInterviewId(phone);
+    if (localId) {
+      return {
+        status: 'found',
+        interviewId: localId,
+        resolvedBy: 'local',
+      };
+    }
+
+    // 1) Disambiguação pendente tem prioridade absoluta.
     const pendingDisambiguation = await this._getDisambiguationState(phone);
 
     if (pendingDisambiguation) {
       const chosen = this._parseDisambiguationChoice(
-        message,
-        pendingDisambiguation.candidates
+        message, pendingDisambiguation.candidates
       );
 
       if (chosen) {
         await this._clearDisambiguationState(phone);
-        await this._rememberResolvedInterview(
-          phone,
-          chosen.interview_id
-        );
+        await this._rememberResolvedInterview(phone, chosen.interview_id);
+        // Fixar também no mapping principal para próximos turnos.
+        await this.rememberInterview(phone, chosen.interview_id);
 
         this._metricIncrement('turnsTotal', {
           status: 'disambiguation_resolved',
@@ -1210,28 +1152,18 @@ class InterviewService {
         };
       }
 
-      // Resposta inválida — repetimos o prompt com a lista original.
       return {
         status: 'disambiguation_invalid',
         candidates: pendingDisambiguation.candidates,
       };
     }
 
-    // 2) Reply-to é determinístico — se temos o ID original, não
-    //    precisamos de cache nem de resolver no backend.
+    // 2) Reply-to é determinístico.
     if (repliedToMessageId) {
       const cached = await this._getResolvedInterview(phone);
-
-      // Não usamos o cache quando há reply-to: o ID manda.
-      // Limpamos para evitar que o próximo turno sem reply-to
-      // use um valor que já não corresponde.
-      if (cached) {
-        await this._clearResolvedInterview(phone);
-      }
+      if (cached) await this._clearResolvedInterview(phone);
     } else {
-      // 3) Sem reply-to: o cache local de routing é válido durante
-      //    a janela da sessão. Só o usamos se não houver ambiguidade
-      //    pendente (já tratada acima) e se não vier um reply-to.
+      // 3) Sem reply-to: cache local de routing.
       const cached = await this._getResolvedInterview(phone);
       if (cached) {
         return {
@@ -1246,8 +1178,8 @@ class InterviewService {
     if (typeof this.yane?.resolveInboundMessage !== 'function') {
       this.logError(
         'yane.resolveInboundMessage indisponível — ' +
-          'verifique se o processo Node foi reiniciado após ' +
-          'actualizar yane-integration.service.js.',
+        'verifique se o processo Node foi reiniciado após ' +
+        'actualizar yane-integration.service.js.',
         null,
         phone,
         { msgId: messageId, turnId }
@@ -1267,15 +1199,11 @@ class InterviewService {
     } catch (error) {
       this._metricIncrement('errorsTotal', { subsystem: 'backend' });
 
-      this.logWarn(
-        'Resolve-inbound falhou — turno em fila.',
-        phone,
-        {
-          msgId: messageId,
-          turnId,
-          error: errorMessage(error),
-        }
-      );
+      this.logWarn('Resolve-inbound falhou — turno em fila.', phone, {
+        msgId: messageId,
+        turnId,
+        error: errorMessage(error),
+      });
 
       const queued = await this._queueIncomingTurn({
         phone,
@@ -1308,10 +1236,9 @@ class InterviewService {
       (confidence === 'high' || confidence === 'medium') &&
       resolution.interview_id
     ) {
-      await this._rememberResolvedInterview(
-        phone,
-        resolution.interview_id
-      );
+      await this._rememberResolvedInterview(phone, resolution.interview_id);
+      // Fixar também no mapping principal para próximos turnos.
+      await this.rememberInterview(phone, resolution.interview_id);
 
       this._metricIncrement('turnsTotal', {
         status: 'routing_resolved',
@@ -1331,11 +1258,7 @@ class InterviewService {
         ? resolution.candidates
         : [];
 
-      if (!candidates.length) {
-        // Backend disse ambíguo mas não devolveu candidatos.
-        // Tratamos como none — o caller reporta órfã.
-        return { status: 'none' };
-      }
+      if (!candidates.length) return { status: 'none' };
 
       await this._storeDisambiguationState(phone, {
         candidates,
@@ -1349,10 +1272,7 @@ class InterviewService {
         candidateCount: String(candidates.length),
       });
 
-      return {
-        status: 'ambiguous',
-        candidates,
-      };
+      return { status: 'ambiguous', candidates };
     }
 
     // 7) none / invalid_phone → sem entrevista.
@@ -1393,21 +1313,12 @@ class InterviewService {
     return turn;
   }
 
-  async _handleTurnResponse({
-    phone,
-    interviewId,
-    turnId,
-    turn,
-  }) {
-    // [FIX-PROCESSING] Backend ainda a processar.
+  async _handleTurnResponse({ phone, interviewId, turnId, turn }) {
     if (turn?.processing === true) {
       this.logDebug(
         'Backend ainda a processar turno anterior; colocando em fila.',
         phone,
-        {
-          interviewId,
-          turnId,
-        }
+        { interviewId, turnId }
       );
 
       const queued = await this._queueIncomingTurn({
@@ -1468,18 +1379,13 @@ class InterviewService {
 
     if (!bubbles.length) {
       this._metricIncrement('turnsTotal', { status: 'success' });
-
       return { handled: true, finished, status: interviewStatus };
     }
 
-    const delivery = await this._sendBubblesWithResult(
-      phone,
-      bubbles
-    );
+    const delivery = await this._sendBubblesWithResult(phone, bubbles);
 
     if (delivery.ok) {
       this._metricIncrement('turnsTotal', { status: 'success' });
-
       return { handled: true, finished, status: interviewStatus };
     }
 
@@ -1508,10 +1414,7 @@ class InterviewService {
       queued: queued === 1,
       finished,
       status: interviewStatus,
-      reason:
-        queued === 1
-          ? 'whatsapp_delivery_queued'
-          : 'delivery_lost',
+      reason: queued === 1 ? 'whatsapp_delivery_queued' : 'delivery_lost',
     };
   }
 
@@ -1521,11 +1424,7 @@ class InterviewService {
 
   async _reportOrphan({ phone, message, messageId }) {
     try {
-      if (
-        typeof this.yane.reportUnmatchedIncoming !== 'function'
-      ) {
-        return;
-      }
+      if (typeof this.yane.reportUnmatchedIncoming !== 'function') return;
 
       await this.yane.reportUnmatchedIncoming({
         phone,
@@ -1533,11 +1432,10 @@ class InterviewService {
         messageId,
       });
     } catch (error) {
-      this.logDebug(
-        'Falha ao reportar mensagem órfã.',
-        phone,
-        { msgId: messageId, error: errorMessage(error) }
-      );
+      this.logDebug('Falha ao reportar mensagem órfã.', phone, {
+        msgId: messageId,
+        error: errorMessage(error),
+      });
     }
   }
 
@@ -1552,10 +1450,7 @@ class InterviewService {
 
   _getQueueKeys(phone) {
     return {
-      queueKey: this.redis.key(
-        CONFIG.pendingTurnKeyPrefix,
-        phone
-      ),
+      queueKey: this.redis.key(CONFIG.pendingTurnKeyPrefix, phone),
       phonesKey: this.redis.key(CONFIG.pendingPhonesKey),
       deadKey: this.redis.key(CONFIG.deadLetterKey),
     };
@@ -1572,28 +1467,20 @@ class InterviewService {
     reason = 'unknown',
   }) {
     const resolvedInterviewId =
-      interviewId ||
-      (await this.resolveInterviewId(phone));
+      interviewId || (await this.resolveInterviewId(phone));
 
     return this._enqueuePendingItem(phone, {
       kind: 'turn',
       schemaVersion: CONFIG.queueSchemaVersion,
-
       phone,
       message,
       messageId: messageId || null,
-
       isButton: Boolean(isButton),
-
       interviewId: resolvedInterviewId || null,
       turnId,
-
-      // [FIX-ROUTING-3] Preservar reply-to para resolução posterior.
       repliedToMessageId: repliedToMessageId || null,
-
       attempts: 0,
       lookupAttempts: 0,
-
       enqueuedAt: Date.now(),
       lastError: null,
       queueReason: reason,
@@ -1614,16 +1501,12 @@ class InterviewService {
     return this._enqueuePendingItem(phone, {
       kind: 'delivery',
       schemaVersion: CONFIG.queueSchemaVersion,
-
       phone,
       bubbles: cleanBubbles,
-
       interviewId: interviewId || null,
       turnId: turnId || randomUUID(),
-
       finished: Boolean(finished),
       interviewStatus,
-
       attempts: 0,
       enqueuedAt: Date.now(),
       lastError: null,
@@ -1634,9 +1517,7 @@ class InterviewService {
     const { queueKey, phonesKey } = this._getQueueKeys(phone);
 
     try {
-      if (
-        typeof this.redis.enqueuePendingItem !== 'function'
-      ) {
+      if (typeof this.redis.enqueuePendingItem !== 'function') {
         throw new Error('enqueuePendingItem_unavailable');
       }
 
@@ -1684,10 +1565,7 @@ class InterviewService {
       const normalizedPhone = normalizePhone(phone);
       if (!normalizedPhone) return;
 
-      await client.sendMessage(
-        normalizedPhone,
-        CONFIG.queueFullMessage
-      );
+      await client.sendMessage(normalizedPhone, CONFIG.queueFullMessage);
     } catch (error) {
       this.logDebug('Falha ao enviar aviso de fila cheia.', phone, {
         error: errorMessage(error),
@@ -1780,9 +1658,7 @@ class InterviewService {
       this._metricSet('deadLetterDepth', depth);
 
       if (depth > 0) {
-        this.logWarn('Dead-letter com itens pendentes.', null, {
-          depth,
-        });
+        this.logWarn('Dead-letter com itens pendentes.', null, { depth });
       }
     } catch (error) {
       this.logDebug(
@@ -1827,9 +1703,7 @@ class InterviewService {
         CONFIG.workerBatchSize
       );
 
-      this._metricSet('queueDepth', phones.length, {
-        kind: 'batch',
-      });
+      this._metricSet('queueDepth', phones.length, { kind: 'batch' });
 
       for (const phone of phones) {
         if (this._closing) break;
@@ -2043,37 +1917,20 @@ class InterviewService {
     }
 
     return {
-      schemaVersion:
-        payload.schemaVersion || CONFIG.queueSchemaVersion,
-
+      schemaVersion: payload.schemaVersion || CONFIG.queueSchemaVersion,
       kind: payload.kind || 'turn',
-
       phone: normalizePhone(payload.phone) || phone,
-
-      message: payload.message
-        ? String(payload.message)
-        : undefined,
-
+      message: payload.message ? String(payload.message) : undefined,
       messageId: payload.messageId || null,
       isButton: Boolean(payload.isButton),
       interviewId: payload.interviewId || null,
       turnId: payload.turnId || randomUUID(),
-
-      // [FIX-ROUTING-3] Preservar entre tentativas.
       repliedToMessageId: payload.repliedToMessageId || null,
-
       bubbles: this._extractBubbles(payload.bubbles),
-
       finished: Boolean(payload.finished),
-      interviewStatus:
-        payload.interviewStatus || 'in_progress',
-
+      interviewStatus: payload.interviewStatus || 'in_progress',
       attempts: Math.max(0, Number(payload.attempts) || 0),
-      lookupAttempts: Math.max(
-        0,
-        Number(payload.lookupAttempts) || 0
-      ),
-
+      lookupAttempts: Math.max(0, Number(payload.lookupAttempts) || 0),
       enqueuedAt: Number(payload.enqueuedAt) || Date.now(),
       lastError: payload.lastError || null,
       queueReason: payload.queueReason || null,
@@ -2115,20 +1972,17 @@ class InterviewService {
       };
     }
 
-    // [FIX-ROUTING-1] Sem entrevista em cache: usar resolve-inbound
-    // em vez de findActiveInterviewByPhone. Esta é a única forma
-    // de acertar quando o mesmo telefone tem múltiplas activas.
     if (!interviewId) {
+      // 1) Mapping local primeiro (o mais fiável).
       interviewId = await this.resolveInterviewId(phone);
 
+      // 2) Cache de routing resolvido.
       if (!interviewId) {
         interviewId = await this._getResolvedInterview(phone);
       }
 
-      if (
-        !interviewId &&
-        lookupAttempts < CONFIG.maxLookupAttempts
-      ) {
+      // 3) resolve-inbound.
+      if (!interviewId && lookupAttempts < CONFIG.maxLookupAttempts) {
         if (typeof this.yane?.resolveInboundMessage !== 'function') {
           return {
             action: 'dead_letter',
@@ -2158,9 +2012,6 @@ class InterviewService {
             await this.rememberInterview(phone, interviewId);
             await this._rememberResolvedInterview(phone, interviewId);
           } else if (confidence === 'ambiguous') {
-            // Turno em fila com ambiguidade resolvida por fora:
-            // o candidato não está no meio da conversa, é uma
-            // mensagem atrasada. Reportamos como órfã.
             this.logWarn(
               'Turno recuperado caiu em routing ambíguo — a reportar órfã.',
               phone,
@@ -2168,15 +2019,12 @@ class InterviewService {
             );
 
             await this._reportOrphan({ phone, message, messageId });
-
             return { action: 'ack' };
           }
         } catch (error) {
           lookupAttempts += 1;
 
-          this._metricIncrement('errorsTotal', {
-            subsystem: 'backend',
-          });
+          this._metricIncrement('errorsTotal', { subsystem: 'backend' });
 
           this.logWarn('Resolve-inbound falhou em retry.', phone, {
             turnId,
@@ -2226,7 +2074,6 @@ class InterviewService {
         );
 
         await this._reportOrphan({ phone, message, messageId });
-
         return { action: 'ack' };
       }
 
@@ -2302,7 +2149,6 @@ class InterviewService {
       };
     }
 
-    // [FIX-PROCESSING] Backend ainda a processar.
     if (turn?.processing === true) {
       this.logDebug(
         'Backend ainda a processar; reagendando turno recuperado.',
@@ -2359,7 +2205,6 @@ class InterviewService {
         interviewId,
         turnId,
       });
-
       return { action: 'ack' };
     }
 
@@ -2396,7 +2241,6 @@ class InterviewService {
       this.log('Resposta pendente entregue.', phone, {
         turnId: payload.turnId,
       });
-
       return { action: 'ack' };
     }
 
@@ -2459,19 +2303,14 @@ class InterviewService {
 
     const backoff =
       Number.isFinite(retryAfterMs) && retryAfterMs > 0
-        ? Math.min(
-            Math.max(retryAfterMs, 1_000),
-            CONFIG.backoffMaxMs
-          )
+        ? Math.min(Math.max(retryAfterMs, 1_000), CONFIG.backoffMaxMs)
         : computedBackoff;
 
     const scheduledAt = Date.now() + Math.round(backoff);
     const { queueKey, phonesKey } = this._getQueueKeys(phone);
 
     try {
-      if (
-        typeof this.redis.reschedulePendingItem !== 'function'
-      ) {
+      if (typeof this.redis.reschedulePendingItem !== 'function') {
         throw new Error('reschedulePendingItem_unavailable');
       }
 
@@ -2483,9 +2322,7 @@ class InterviewService {
         score: scheduledAt,
       });
 
-      if (!updatedOk) {
-        throw new Error('reschedule_pending_item_failed');
-      }
+      if (!updatedOk) throw new Error('reschedule_pending_item_failed');
 
       this._metricIncrement('queueRequeued', {
         kind: updated.kind || 'turn',
@@ -2523,9 +2360,7 @@ class InterviewService {
       const score = Date.now() + CONFIG.deadLetterRetryMs;
       const { queueKey, phonesKey } = this._getQueueKeys(phone);
 
-      if (
-        typeof this.redis.reschedulePendingItem !== 'function'
-      ) {
+      if (typeof this.redis.reschedulePendingItem !== 'function') {
         throw new Error('reschedulePendingItem_unavailable');
       }
 
@@ -2554,8 +2389,7 @@ class InterviewService {
   }
 
   async _deadLetterPendingItem(phone, context = {}) {
-    const { queueKey, phonesKey, deadKey } =
-      this._getQueueKeys(phone);
+    const { queueKey, phonesKey, deadKey } = this._getQueueKeys(phone);
 
     const item = {
       phone,
@@ -2564,9 +2398,7 @@ class InterviewService {
     };
 
     try {
-      if (
-        typeof this.redis.movePendingToDeadLetter !== 'function'
-      ) {
+      if (typeof this.redis.movePendingToDeadLetter !== 'function') {
         throw new Error('movePendingToDeadLetter_unavailable');
       }
 
@@ -2715,20 +2547,13 @@ class InterviewService {
 
   _isFallbackCoolingDown(phone) {
     const last = this._fallbackSentAt.get(phone);
-
-    return Boolean(
-      last && Date.now() - last < CONFIG.fallbackCooldownMs
-    );
+    return Boolean(last && Date.now() - last < CONFIG.fallbackCooldownMs);
   }
 
   _trackFallback(phone, timestamp = Date.now()) {
     this._fallbackSentAt.set(phone, timestamp);
 
-    if (
-      this._fallbackSentAt.size < CONFIG.fallbackSweepThreshold
-    ) {
-      return;
-    }
+    if (this._fallbackSentAt.size < CONFIG.fallbackSweepThreshold) return;
 
     for (const [key, createdAt] of this._fallbackSentAt) {
       if (timestamp - createdAt > CONFIG.fallbackCooldownMs) {
@@ -2736,20 +2561,13 @@ class InterviewService {
       }
     }
 
-    if (
-      this._fallbackSentAt.size <= CONFIG.fallbackHardLimit
-    ) {
-      return;
-    }
+    if (this._fallbackSentAt.size <= CONFIG.fallbackHardLimit) return;
 
-    const overflow =
-      this._fallbackSentAt.size - CONFIG.fallbackHardLimit;
-
+    const overflow = this._fallbackSentAt.size - CONFIG.fallbackHardLimit;
     let removed = 0;
 
     for (const key of this._fallbackSentAt.keys()) {
       if (removed >= overflow) break;
-
       this._fallbackSentAt.delete(key);
       removed += 1;
     }
@@ -2823,10 +2641,7 @@ class InterviewService {
     for (const part of parts) {
       const previous = result[result.length - 1];
 
-      if (
-        previous &&
-        (previous.length < 60 || part.length < 40)
-      ) {
+      if (previous && (previous.length < 60 || part.length < 40)) {
         result[result.length - 1] = `${previous}\n\n${part}`;
       } else {
         result.push(part);

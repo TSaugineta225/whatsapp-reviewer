@@ -1,40 +1,29 @@
 // src/services/yane-integration.service.js
 //
-// Cliente HTTP entre o serviço WhatsApp/Node e o backend Python do Yane.
+// Cliente HTTP entre o Node e o backend Python do Yane.
 //
-// POLÍTICA DE RETRY
-// -----------------
-// ESTE SERVIÇO NÃO FAZ RETRY.
-// O InterviewService decide quando repetir uma operação.
+// FILOSOFIA
+//   - Sem retry interno. O InterviewService decide quando repetir.
+//   - Erros normalizados (status, code, retryable, retryAfterMs).
+//   - Idempotency-Key = turn_id em todos os turnos.
+//   - Endpoints inexistentes no backend degradam graciosamente.
 //
-//   - turn_id identifica a operação de negócio.
-//   - Idempotency-Key usa exactamente o mesmo turn_id.
-//   - Cada tentativa HTTP recebe um X-Request-Id diferente.
+// [FALLBACK-RESOLVE]
+//   resolveInboundMessage tenta POST /interviews/resolve-inbound.
+//   Se o endpoint não existir (404/405/501) ou rebentar (500), cai
+//   automaticamente para GET /interviews/by-phone/{phone} e devolve
+//   a mesma forma de resposta. O bot continua operacional.
 //
-// [FIX-TIMEOUT]
-//   O timeout do `turn` sobe de 45s para 300s.
-//
-// [FIX-ROUTING-1]
-//   Novo método resolveInboundMessage(). Delega ao backend
-//   POST /interviews/resolve-inbound o routing de uma mensagem
-//   inbound quando o mesmo telefone tem múltiplas entrevistas
-//   activas. Substitui o uso de findActiveInterviewByPhone no
-//   caminho crítico, mantendo o método antigo disponível para
-//   compatibilidade.
-//
-// [FIX-ROUTING-2]
-//   Header X-Bot-Secret enviado em todos os pedidos quando
-//   YANE_SERVICE_TOKEN está definido. O backend valida-o no
-//   endpoint /resolve-inbound com settings.WHATSAPP_BOT_SECRET.
+// [FALLBACK-CANCEL]
+//   cancelInterview devolve { success: true, skipped: true } quando
+//   o endpoint não existe, em vez de lançar. O !reset do candidato
+//   deixa de partir.
 
 'use strict';
 
 const { randomUUID } = require('crypto');
+const pino = require('pino');
 const BaseService = require('./base.service');
-
-// =============================================================================
-// CONFIG
-// =============================================================================
 
 const DEFAULT_API_URL = 'http://localhost:8000/api';
 
@@ -51,50 +40,32 @@ const MAX_MESSAGE_BODY_CHARS = 4_000;
 const MAX_RESPONSE_BODY_BYTES = 2 * 1024 * 1024;
 
 const ENDPOINTS = Object.freeze({
-  interviewTurn: (interviewId) =>
-    `/interviews/${encodeURIComponent(String(interviewId))}/turn`,
-
-  interviewCancel: (interviewId) =>
-    `/interviews/${encodeURIComponent(String(interviewId))}/cancel`,
-
-  interviewByPhone: (phone) =>
-    `/interviews/by-phone/${encodeURIComponent(String(phone))}`,
-
-  // [FIX-ROUTING-1] Endpoint central de routing inbound.
+  interviewTurn: (id) => `/interviews/${encodeURIComponent(String(id))}/turn`,
+  interviewCancel: (id) => `/interviews/${encodeURIComponent(String(id))}/cancel`,
+  interviewByPhone: (p) => `/interviews/by-phone/${encodeURIComponent(String(p))}`,
   resolveInbound: '/interviews/resolve-inbound',
-
   messageStatus: '/webhooks/message-status',
-
   unmatchedIncoming: '/webhooks/unmatched-incoming',
-
   health: '/health',
 });
 
-const RETRYABLE_HTTP_STATUSES = new Set([
-  408, 425, 429,
-  500, 501, 502, 503, 504, 505, 507, 509,
+const RETRYABLE_STATUSES = new Set([
+  408, 425, 429, 500, 501, 502, 503, 504, 505, 507, 509,
   520, 521, 522, 523, 524,
 ]);
+
+const MISSING_ENDPOINT_STATUSES = new Set([404, 405, 501]);
 
 // =============================================================================
 // HELPERS
 // =============================================================================
 
-function clean(value) {
-  return String(value ?? '').trim();
-}
-
-function normalizeUrl(url) {
-  return clean(url).replace(/\/+$/, '');
-}
+function clean(v) { return String(v ?? '').trim(); }
+function normalizeUrl(url) { return clean(url).replace(/\/+$/, ''); }
 
 function toPositiveNumber(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : fallback;
-}
-
-function isJsonContentType(contentType) {
-  return clean(contentType).toLowerCase().includes('json');
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 function truncate(value, max = MAX_ERROR_BODY_CHARS) {
@@ -102,105 +73,67 @@ function truncate(value, max = MAX_ERROR_BODY_CHARS) {
 }
 
 function maskPhone(phone) {
-  const digits = String(phone || '').replace(/\D/g, '');
-  if (digits.length < 6) return '***';
-  return `${digits.slice(0, 3)}***${digits.slice(-3)}`;
+  const d = String(phone || '').replace(/\D/g, '');
+  if (d.length < 6) return '***';
+  return `${d.slice(0, 3)}***${d.slice(-3)}`;
 }
 
 function maskJid(jid) {
-  const value = clean(jid);
-  if (!value) return '';
-
-  if (value.includes('@')) {
-    const [local, suffix] = value.split('@');
-    if (/\d/.test(local)) {
-      return `${maskPhone(local)}@${suffix}`;
-    }
+  const v = clean(jid);
+  if (!v) return '';
+  if (v.includes('@')) {
+    const [local, suffix] = v.split('@');
+    if (/\d/.test(local)) return `${maskPhone(local)}@${suffix}`;
   }
-
-  return maskPhone(value);
+  return maskPhone(v);
 }
 
-function getErrorCode(error) {
-  return clean(error?.code || error?.cause?.code || '').toUpperCase();
-}
-
-function isAbortError(error) {
-  return error?.name === 'AbortError' || error?.name === 'TimeoutError';
-}
-
-function safeJsonStringify(value) {
-  try {
-    const serialized = JSON.stringify(value);
-    if (serialized === undefined && value !== undefined) {
-      throw new TypeError('JSON.stringify() retornou undefined.');
-    }
-    return serialized;
-  } catch (error) {
-    if (error instanceof YaneIntegrationError) throw error;
-
-    throw new YaneIntegrationError(
-      'Não foi possível serializar o payload da API Yane.',
-      {
-        code: 'YANE_SERIALIZATION_ERROR',
-        retryable: false,
-        cause: error,
-      }
-    );
-  }
-}
-
-function safeStringifyForError(value) {
-  try {
-    return JSON.stringify(value);
-  } catch (_) {
-    return '';
-  }
+function isAbortError(e) {
+  return e?.name === 'AbortError' || e?.name === 'TimeoutError';
 }
 
 function parseRetryAfter(value) {
   const raw = clean(value);
   if (!raw) return null;
-
   const seconds = Number(raw);
-  if (Number.isFinite(seconds) && seconds >= 0) {
-    return Math.round(seconds * 1_000);
-  }
-
-  const timestamp = Date.parse(raw);
-  if (Number.isFinite(timestamp)) {
-    return Math.max(0, timestamp - Date.now());
-  }
-
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const ts = Date.parse(raw);
+  if (Number.isFinite(ts)) return Math.max(0, ts - Date.now());
   return null;
 }
 
 function extractRetryAfterMs(error) {
   const direct = Number(error?.retryAfterMs);
-  if (Number.isFinite(direct) && direct >= 0) {
-    return Math.round(direct);
-  }
-
-  const candidates = [
+  if (Number.isFinite(direct) && direct >= 0) return Math.round(direct);
+  for (const c of [
     error?.headers?.get?.('retry-after'),
     error?.response?.headers?.get?.('retry-after'),
     error?.cause?.headers?.get?.('retry-after'),
-    error?.cause?.response?.headers?.get?.('retry-after'),
-  ];
-
-  for (const candidate of candidates) {
-    const parsed = parseRetryAfter(candidate);
+  ]) {
+    const parsed = parseRetryAfter(c);
     if (parsed !== null) return parsed;
   }
-
   return null;
 }
 
-function normalizeSuppressedStatuses(value) {
-  if (!value) return new Set();
-  if (value instanceof Set) return value;
-  if (Array.isArray(value)) return new Set(value);
-  return new Set([value]);
+function safeJsonStringify(value) {
+  try {
+    const s = JSON.stringify(value);
+    if (s === undefined && value !== undefined) {
+      throw new TypeError('JSON.stringify() devolveu undefined.');
+    }
+    return s;
+  } catch (error) {
+    if (error instanceof YaneIntegrationError) throw error;
+    throw new YaneIntegrationError(
+      'Não foi possível serializar o payload.',
+      { code: 'YANE_SERIALIZATION_ERROR', retryable: false, cause: error }
+    );
+  }
+}
+
+function safeStringify(value) {
+  try { return JSON.stringify(value); } catch (_) { return ''; }
 }
 
 // =============================================================================
@@ -208,43 +141,31 @@ function normalizeSuppressedStatuses(value) {
 // =============================================================================
 
 class YaneIntegrationError extends Error {
-  constructor(
-    message,
-    {
-      status = null,
-      code = 'YANE_HTTP_ERROR',
-      retryable = false,
-      endpoint = null,
-      method = null,
-      correlationId = null,
-      requestId = null,
-      retryAfterMs = null,
-      cause = null,
-    } = {}
-  ) {
+  constructor(message, {
+    status = null,
+    code = 'YANE_HTTP_ERROR',
+    retryable = false,
+    endpoint = null,
+    method = null,
+    correlationId = null,
+    requestId = null,
+    retryAfterMs = null,
+    cause = null,
+  } = {}) {
     super(message);
-
     this.name = 'YaneIntegrationError';
-
     this.status = Number.isInteger(status) ? status : null;
     this.code = clean(code) || 'YANE_HTTP_ERROR';
     this.retryable = Boolean(retryable);
-
     this.endpoint = endpoint || null;
     this.method = clean(method).toUpperCase() || null;
-
     this.correlationId = correlationId || null;
     this.requestId = requestId || null;
-
     this.retryAfterMs = Number.isFinite(retryAfterMs)
       ? Math.max(0, retryAfterMs)
       : null;
-
     if (cause) this.cause = cause;
-
-    if (Error.captureStackTrace) {
-      Error.captureStackTrace(this, YaneIntegrationError);
-    }
+    if (Error.captureStackTrace) Error.captureStackTrace(this, YaneIntegrationError);
   }
 
   toLogObject() {
@@ -271,33 +192,17 @@ class YaneIntegrationService extends BaseService {
   constructor(options = {}) {
     super();
 
-    this.yaneApiUrl = normalizeUrl(
-      process.env.YANE_API_URL || DEFAULT_API_URL
-    );
-
+    this.yaneApiUrl = normalizeUrl(process.env.YANE_API_URL || DEFAULT_API_URL);
     this.defaultTimeoutMs = toPositiveNumber(
-      process.env.YANE_API_TIMEOUT,
-      DEFAULT_TIMEOUTS.default
+      process.env.YANE_API_TIMEOUT, DEFAULT_TIMEOUTS.default
     );
 
     this.timeouts = Object.freeze({
       default: this.defaultTimeoutMs,
-      turn: toPositiveNumber(
-        process.env.YANE_TURN_TIMEOUT,
-        DEFAULT_TIMEOUTS.turn
-      ),
-      lookup: toPositiveNumber(
-        process.env.YANE_LOOKUP_TIMEOUT,
-        DEFAULT_TIMEOUTS.lookup
-      ),
-      status: toPositiveNumber(
-        process.env.YANE_STATUS_TIMEOUT,
-        DEFAULT_TIMEOUTS.status
-      ),
-      health: toPositiveNumber(
-        process.env.YANE_HEALTH_TIMEOUT,
-        DEFAULT_TIMEOUTS.health
-      ),
+      turn: toPositiveNumber(process.env.YANE_TURN_TIMEOUT, DEFAULT_TIMEOUTS.turn),
+      lookup: toPositiveNumber(process.env.YANE_LOOKUP_TIMEOUT, DEFAULT_TIMEOUTS.lookup),
+      status: toPositiveNumber(process.env.YANE_STATUS_TIMEOUT, DEFAULT_TIMEOUTS.status),
+      health: toPositiveNumber(process.env.YANE_HEALTH_TIMEOUT, DEFAULT_TIMEOUTS.health),
     });
 
     this.serviceToken =
@@ -305,16 +210,15 @@ class YaneIntegrationService extends BaseService {
       clean(process.env.YANE_API_KEY) ||
       null;
 
-    // [FIX-ROUTING-2] Segredo partilhado com o backend para o
-    // endpoint /interviews/resolve-inbound. Se não estiver
-    // definido, usa o mesmo serviceToken — o backend aceita
-    // ambos no header.
     this.botSecret =
-      clean(process.env.WHATSAPP_BOT_SECRET) ||
-      this.serviceToken;
+      clean(process.env.WHATSAPP_BOT_SECRET) || this.serviceToken;
 
     this.fetch = options.fetchImpl || globalThis.fetch;
-    this.logger = options.logger || this._createLogger();
+
+    this.logger = options.logger || pino({
+      level: process.env.LOG_LEVEL || 'info',
+      base: { service: 'yane-integration' },
+    });
 
     this._responseMetadata = new WeakMap();
 
@@ -325,32 +229,13 @@ class YaneIntegrationService extends BaseService {
     }
 
     if (!this.serviceToken) {
-      this.logWarn(
-        'Nenhum token configurado. Defina YANE_SERVICE_TOKEN ou YANE_API_KEY.'
-      );
+      this.logWarn('Nenhum token configurado. Defina YANE_SERVICE_TOKEN.');
     }
 
-    if (!this.botSecret) {
-      this.logWarn(
-        'Nenhum segredo do bot configurado. Defina WHATSAPP_BOT_SECRET ' +
-        'ou YANE_SERVICE_TOKEN. /resolve-inbound falhará com 401.'
-      );
-    }
-
-    this.log('Serviço de integração Yane inicializado.', {
+    this.log('YaneIntegrationService inicializado.', {
       baseUrl: this.yaneApiUrl,
-      timeouts: this.timeouts,
       authenticated: Boolean(this.serviceToken),
       botSecretConfigured: Boolean(this.botSecret),
-    });
-  }
-
-  _createLogger() {
-    const pino = require('pino');
-
-    return pino({
-      level: process.env.LOG_LEVEL || 'info',
-      base: { service: 'yane-integration' },
     });
   }
 
@@ -360,62 +245,46 @@ class YaneIntegrationService extends BaseService {
 
   _safeLogContext(context = {}) {
     const safe = {};
-
     for (const [key, value] of Object.entries(context)) {
       if (value === undefined || value === null) continue;
-
       if (key === 'phone' || key === 'recipient') {
         safe[key] = maskPhone(value);
         continue;
       }
-
-      if (key === 'jid' || key === 'remoteJid' || key === 'altJid') {
+      if (key === 'jid' || key === 'remoteJid' || key === 'altJid' || key === 'lid') {
         safe[key] = maskJid(value);
         continue;
       }
-
-      if (key === 'body' || key === 'message' || key === 'preview') {
+      if (key === 'body' || key === 'message' || key === 'preview' || key === 'text') {
         continue;
       }
-
       safe[key] = value;
     }
-
     return safe;
   }
 
   _log(level, message, context = {}) {
     try {
-      const loggerMethod = this.logger?.[level];
-      if (typeof loggerMethod !== 'function') return;
-
-      loggerMethod.call(this.logger, this._safeLogContext(context), message);
-    } catch (_) {
-      // Logging nunca pode derrubar a integração.
-    }
+      const method = this.logger?.[level];
+      if (typeof method !== 'function') return;
+      method.call(this.logger, this._safeLogContext(context), message);
+    } catch (_) {}
   }
 
-  log(message, context = {}) {
-    this._log('info', message, context);
-  }
-
-  logWarn(message, context = {}) {
-    this._log('warn', message, context);
-  }
+  log(m, c) { this._log('info', m, c); }
+  logWarn(m, c) { this._log('warn', m, c); }
 
   logError(message, error = null, context = {}) {
-    const safeContext = this._safeLogContext(context);
-
+    const safe = this._safeLogContext(context);
     if (error) {
       if (error instanceof YaneIntegrationError) {
-        Object.assign(safeContext, error.toLogObject());
+        Object.assign(safe, error.toLogObject());
       } else {
-        safeContext.error = error?.message || String(error);
-        safeContext.code = error?.code || null;
+        safe.error = error?.message || String(error);
+        safe.code = error?.code || null;
       }
     }
-
-    this._log('error', message, safeContext);
+    this._log('error', message, safe);
   }
 
   // ===========================================================================
@@ -423,8 +292,8 @@ class YaneIntegrationService extends BaseService {
   // ===========================================================================
 
   buildUrl(endpoint) {
-    const normalizedEndpoint = `/${clean(endpoint).replace(/^\/+/, '')}`;
-    return `${this.yaneApiUrl}${normalizedEndpoint}`;
+    const e = `/${clean(endpoint).replace(/^\/+/, '')}`;
+    return `${this.yaneApiUrl}${e}`;
   }
 
   getHeaders({
@@ -444,137 +313,76 @@ class YaneIntegrationService extends BaseService {
       headers.Authorization = `Bearer ${this.serviceToken}`;
     }
 
-    // [FIX-ROUTING-2] Segredo partilhado com o backend.
-    // Enviado sempre que configurado; o backend só o valida
-    // no endpoint /resolve-inbound.
     if (this.botSecret) {
       headers['X-Bot-Secret'] = String(this.botSecret);
     }
 
-    if (idempotencyKey) {
-      headers['Idempotency-Key'] = String(idempotencyKey);
-    }
-
-    if (requestId) {
-      headers['X-Request-Id'] = String(requestId);
-    }
-
-    if (correlationId) {
-      headers['X-Correlation-Id'] = String(correlationId);
-    }
+    if (idempotencyKey) headers['Idempotency-Key'] = String(idempotencyKey);
+    if (requestId) headers['X-Request-Id'] = String(requestId);
+    if (correlationId) headers['X-Correlation-Id'] = String(correlationId);
 
     return headers;
-  }
-
-  // ===========================================================================
-  // RESPONSE METADATA
-  // ===========================================================================
-
-  _attachResponseMetadata(response, metadata) {
-    if (!response || typeof response !== 'object') return;
-
-    this._responseMetadata.set(
-      response,
-      Object.freeze({ ...metadata })
-    );
-
-    try {
-      response.__yaneRequestId = metadata.requestId;
-      response.__yaneCorrelationId = metadata.correlationId;
-    } catch (_) {
-      // Response pode ser frozen.
-    }
-  }
-
-  _getResponseMetadata(response) {
-    if (!response || typeof response !== 'object') return {};
-
-    return this._responseMetadata.get(response) || {
-      requestId: response.__yaneRequestId || null,
-      correlationId: response.__yaneCorrelationId || null,
-    };
   }
 
   // ===========================================================================
   // HTTP CORE
   // ===========================================================================
 
-  async request(
-    endpoint,
-    {
-      method = 'GET',
-      body = undefined,
-      includeAuth = true,
-      timeoutMs = this.defaultTimeoutMs,
-      idempotencyKey = null,
-      correlationId = null,
-      logLabel = 'YANE',
-      logContext = {},
-      headers = {},
-      suppressErrorLog = [],
-    } = {}
-  ) {
+  async request(endpoint, {
+    method = 'GET',
+    body,
+    includeAuth = true,
+    timeoutMs = this.defaultTimeoutMs,
+    idempotencyKey = null,
+    correlationId = null,
+    logLabel = 'YANE',
+    logContext = {},
+    headers = {},
+    suppressErrorLog = [],
+  } = {}) {
     const normalizedMethod = clean(method).toUpperCase();
     const url = this.buildUrl(endpoint);
-
-    const normalizedTimeout = toPositiveNumber(
-      timeoutMs,
-      this.defaultTimeoutMs
-    );
+    const normalizedTimeout = toPositiveNumber(timeoutMs, this.defaultTimeoutMs);
 
     const operationCorrelationId = clean(correlationId) || randomUUID();
     const requestId = randomUUID();
 
-    const suppressedStatuses = normalizeSuppressedStatuses(suppressErrorLog);
-
-    const controller = new AbortController();
-    const timeoutHandle = setTimeout(
-      () => controller.abort(),
-      normalizedTimeout
+    const suppressed = new Set(
+      Array.isArray(suppressErrorLog) ? suppressErrorLog : [suppressErrorLog]
     );
 
-    if (typeof timeoutHandle.unref === 'function') {
-      timeoutHandle.unref();
-    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), normalizedTimeout);
+    if (typeof timer.unref === 'function') timer.unref();
 
     const options = {
       method: normalizedMethod,
       headers: this.getHeaders({
-        includeAuth,
-        idempotencyKey,
-        requestId,
-        correlationId: operationCorrelationId,
-        extra: headers,
+        includeAuth, idempotencyKey, requestId,
+        correlationId: operationCorrelationId, extra: headers,
       }),
       signal: controller.signal,
     };
 
     try {
-      if (body !== undefined) {
-        options.body = safeJsonStringify(body);
-      }
+      if (body !== undefined) options.body = safeJsonStringify(body);
 
       const response = await this.fetch(url, options);
 
-      this._attachResponseMetadata(response, {
-        requestId,
-        correlationId: operationCorrelationId,
-      });
+      this._responseMetadata.set(response, Object.freeze({
+        requestId, correlationId: operationCorrelationId,
+      }));
 
       if (!response.ok) {
-        const httpError = await this.createHttpError(response, {
-          endpoint,
-          method: normalizedMethod,
-          correlationId: operationCorrelationId,
-          requestId,
+        const httpError = await this._createHttpError(response, {
+          endpoint, method: normalizedMethod,
+          correlationId: operationCorrelationId, requestId,
         });
 
-        if (!suppressedStatuses.has(httpError.status)) {
+        if (!suppressed.has(httpError.status)) {
           this.logError(`${logLabel} request falhou.`, httpError, {
-            ...logContext,
-            endpoint,
-            method: normalizedMethod,
-            requestId,
+            ...logContext, endpoint,
+            method: normalizedMethod, requestId,
             correlationId: operationCorrelationId,
           });
         }
@@ -584,716 +392,253 @@ class YaneIntegrationService extends BaseService {
 
       return response;
     } catch (error) {
-      const normalized = this.normalizeRequestError(error, {
-        endpoint,
-        method: normalizedMethod,
+      const normalized = this._normalizeRequestError(error, {
+        endpoint, method: normalizedMethod,
         timeoutMs: normalizedTimeout,
         correlationId: operationCorrelationId,
-        requestId,
-        signal: controller.signal,
+        requestId, signal: controller.signal,
       });
 
       const alreadyLogged = normalized.__yaneLogged === true;
 
-      if (!alreadyLogged && !suppressedStatuses.has(normalized.status)) {
+      if (!alreadyLogged && !suppressed.has(normalized.status)) {
         this.logError(`${logLabel} request falhou.`, normalized, {
-          ...logContext,
-          endpoint,
-          method: normalizedMethod,
-          requestId,
+          ...logContext, endpoint,
+          method: normalizedMethod, requestId,
           correlationId: operationCorrelationId,
         });
-
         normalized.__yaneLogged = true;
       }
 
       throw normalized;
     } finally {
-      clearTimeout(timeoutHandle);
+      clearTimeout(timer);
     }
   }
 
-  normalizeRequestError(
-    error,
-    { endpoint, method, timeoutMs, correlationId, requestId, signal = null }
-  ) {
+  _normalizeRequestError(error, { endpoint, method, timeoutMs, correlationId, requestId, signal }) {
     if (error instanceof YaneIntegrationError) {
       if (!error.endpoint) error.endpoint = endpoint;
       if (!error.method) error.method = method;
       if (!error.correlationId) error.correlationId = correlationId;
       if (!error.requestId) error.requestId = requestId;
-
       if (error.retryAfterMs === null) {
         error.retryAfterMs = extractRetryAfterMs(error);
       }
-
-      if (error.status !== null) {
-        error.__yaneLogged = true;
-      }
-
+      if (error.status !== null) error.__yaneLogged = true;
       return error;
     }
 
     const timedOut = Boolean(signal?.aborted) || isAbortError(error);
 
     if (timedOut) {
-      return new YaneIntegrationError(
-        `Timeout após ${timeoutMs}ms.`,
-        {
-          code: 'YANE_TIMEOUT',
-          retryable: true,
-          endpoint,
-          method,
-          correlationId,
-          requestId,
-          retryAfterMs: extractRetryAfterMs(error),
-          cause: error,
-        }
-      );
+      return new YaneIntegrationError(`Timeout após ${timeoutMs}ms.`, {
+        code: 'YANE_TIMEOUT', retryable: true,
+        endpoint, method, correlationId, requestId, cause: error,
+      });
     }
 
-    const code = getErrorCode(error);
+    const code = clean(error?.code || error?.cause?.code).toUpperCase();
 
     if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT') {
-      return new YaneIntegrationError(
-        `Timeout após ${timeoutMs}ms.`,
-        {
-          code: 'YANE_TIMEOUT',
-          retryable: true,
-          endpoint,
-          method,
-          correlationId,
-          requestId,
-          retryAfterMs: extractRetryAfterMs(error),
-          cause: error,
-        }
-      );
+      return new YaneIntegrationError(`Timeout após ${timeoutMs}ms.`, {
+        code: 'YANE_TIMEOUT', retryable: true,
+        endpoint, method, correlationId, requestId, cause: error,
+      });
     }
 
     return new YaneIntegrationError(
       clean(error?.message) || 'Falha de rede ao contactar a API Yane.',
       {
-        code: 'YANE_NETWORK_ERROR',
-        retryable: true,
-        endpoint,
-        method,
-        correlationId,
-        requestId,
-        retryAfterMs: extractRetryAfterMs(error),
-        cause: error,
+        code: 'YANE_NETWORK_ERROR', retryable: true,
+        endpoint, method, correlationId, requestId,
+        retryAfterMs: extractRetryAfterMs(error), cause: error,
       }
     );
   }
 
-  async createHttpError(
-    response,
-    { endpoint, method, correlationId, requestId }
-  ) {
+  async _createHttpError(response, { endpoint, method, correlationId, requestId }) {
     const status = Number(response?.status) || null;
     const contentType = response?.headers?.get?.('content-type') || '';
-    const retryAfterMs = parseRetryAfter(
-      response?.headers?.get?.('retry-after')
-    );
+    const retryAfterMs = parseRetryAfter(response?.headers?.get?.('retry-after'));
 
     let detail = '';
     let bodyError = null;
 
     try {
-      const text = await this.readResponseText(response, {
-        endpoint,
-        method,
-        correlationId,
-        requestId,
+      const text = await this._readResponseText(response, {
+        endpoint, method, correlationId, requestId,
       });
-
       if (clean(text)) {
-        if (isJsonContentType(contentType)) {
+        if (clean(contentType).toLowerCase().includes('json')) {
           try {
             const data = JSON.parse(text);
-            detail = this.extractErrorDetail(data);
-          } catch (_) {
-            detail = text;
-          }
+            detail = this._extractErrorDetail(data);
+          } catch (_) { detail = text; }
         } else {
           detail = text;
         }
       }
-    } catch (error) {
-      bodyError = error;
-    }
+    } catch (e) { bodyError = e; }
 
-    if (
-      bodyError instanceof YaneIntegrationError &&
-      bodyError.code === 'YANE_RESPONSE_TOO_LARGE'
-    ) {
-      return new YaneIntegrationError(
-        `HTTP ${status}: resposta de erro excedeu o tamanho permitido.`,
-        {
-          status,
-          code: `YANE_HTTP_${status}`,
-          retryable: this.isRetryableStatus(status),
-          endpoint,
-          method,
-          correlationId,
-          requestId,
-          retryAfterMs,
-          cause: bodyError,
-        }
-      );
-    }
+    const message = truncate(detail) || clean(response?.statusText) || 'Erro desconhecido.';
 
-    const message =
-      truncate(detail) ||
-      clean(response?.statusText) ||
-      'Erro desconhecido na API Yane.';
-
-    return new YaneIntegrationError(
-      `HTTP ${status}: ${message}`,
-      {
-        status,
-        code: `YANE_HTTP_${status}`,
-        retryable: this.isRetryableStatus(status),
-        endpoint,
-        method,
-        correlationId,
-        requestId,
-        retryAfterMs,
-        cause: bodyError,
-      }
-    );
+    return new YaneIntegrationError(`HTTP ${status}: ${message}`, {
+      status, code: `YANE_HTTP_${status}`,
+      retryable: this._isRetryableStatus(status),
+      endpoint, method, correlationId, requestId, retryAfterMs, cause: bodyError,
+    });
   }
 
-  extractErrorDetail(data) {
-    if (data === null || data === undefined) return '';
+  _extractErrorDetail(data) {
+    if (data == null) return '';
     if (typeof data === 'string') return data;
     if (typeof data?.detail === 'string') return data.detail;
     if (typeof data?.message === 'string') return data.message;
     if (typeof data?.error === 'string') return data.error;
-
-    if (data?.detail !== undefined) {
-      return safeStringifyForError(data.detail);
-    }
-
-    return safeStringifyForError(data);
+    if (data?.detail !== undefined) return safeStringify(data.detail);
+    return safeStringify(data);
   }
 
-  isRetryableStatus(status) {
+  _isRetryableStatus(status) {
     if (!Number.isInteger(status)) return false;
-    return RETRYABLE_HTTP_STATUSES.has(status) || status >= 500;
+    return RETRYABLE_STATUSES.has(status) || status >= 500;
   }
 
-  // ===========================================================================
-  // RESPONSE BODY
-  // ===========================================================================
-
-  async readResponseText(
-    response,
-    { endpoint = null, method = null, correlationId = null, requestId = null } = {}
-  ) {
+  async _readResponseText(response, { endpoint, method, correlationId, requestId } = {}) {
     if (!response) {
       throw new YaneIntegrationError('Resposta HTTP ausente.', {
-        code: 'YANE_RESPONSE_MISSING',
-        retryable: false,
-        endpoint,
-        method,
-        correlationId,
-        requestId,
+        code: 'YANE_RESPONSE_MISSING', retryable: false,
+        endpoint, method, correlationId, requestId,
       });
     }
 
     const contentLength = response.headers?.get?.('content-length');
-
     if (contentLength) {
-      const declaredSize = Number(contentLength);
-
-      if (
-        Number.isFinite(declaredSize) &&
-        declaredSize > MAX_RESPONSE_BODY_BYTES
-      ) {
-        throw new YaneIntegrationError(
-          'Resposta da API Yane excedeu o tamanho permitido.',
-          {
-            status: Number.isInteger(response.status) ? response.status : null,
-            code: 'YANE_RESPONSE_TOO_LARGE',
-            retryable: false,
-            endpoint,
-            method,
-            correlationId,
-            requestId,
-          }
-        );
-      }
-    }
-
-    if (!response.body) {
-      try {
-        const text = await response.text();
-
-        if (
-          Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BODY_BYTES
-        ) {
-          throw new YaneIntegrationError(
-            'Resposta da API Yane excedeu o tamanho permitido.',
-            {
-              status: Number.isInteger(response.status)
-                ? response.status
-                : null,
-              code: 'YANE_RESPONSE_TOO_LARGE',
-              retryable: false,
-              endpoint,
-              method,
-              correlationId,
-              requestId,
-            }
-          );
-        }
-
-        return text;
-      } catch (error) {
-        if (error instanceof YaneIntegrationError) throw error;
-
-        throw new YaneIntegrationError(
-          'Falha ao ler resposta da API Yane.',
-          {
-            status: Number.isInteger(response.status) ? response.status : null,
-            code: 'YANE_RESPONSE_READ_ERROR',
-            retryable: false,
-            endpoint,
-            method,
-            correlationId,
-            requestId,
-            cause: error,
-          }
-        );
-      }
-    }
-
-    if (typeof response.body.getReader !== 'function') {
-      throw new YaneIntegrationError(
-        'Resposta HTTP não suporta leitura por stream.',
-        {
+      const declared = Number(contentLength);
+      if (Number.isFinite(declared) && declared > MAX_RESPONSE_BODY_BYTES) {
+        throw new YaneIntegrationError('Resposta excedeu o tamanho permitido.', {
           status: Number.isInteger(response.status) ? response.status : null,
-          code: 'YANE_RESPONSE_STREAM_ERROR',
-          retryable: false,
-          endpoint,
-          method,
-          correlationId,
-          requestId,
-        }
-      );
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    const chunks = [];
-
-    let totalBytes = 0;
-    let readerCancelled = false;
-
-    const cancelReader = async () => {
-      if (readerCancelled) return;
-      readerCancelled = true;
-
-      try {
-        await reader.cancel();
-      } catch (_) {
-        // Best-effort.
+          code: 'YANE_RESPONSE_TOO_LARGE', retryable: false,
+          endpoint, method, correlationId, requestId,
+        });
       }
-    };
+    }
 
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!value) continue;
-
-        totalBytes += value.byteLength;
-
-        if (totalBytes > MAX_RESPONSE_BODY_BYTES) {
-          await cancelReader();
-
-          throw new YaneIntegrationError(
-            'Resposta da API Yane excedeu o tamanho permitido.',
-            {
-              status: Number.isInteger(response.status)
-                ? response.status
-                : null,
-              code: 'YANE_RESPONSE_TOO_LARGE',
-              retryable: false,
-              endpoint,
-              method,
-              correlationId,
-              requestId,
-            }
-          );
-        }
-
-        chunks.push(decoder.decode(value, { stream: true }));
-      }
-
-      chunks.push(decoder.decode());
-      return chunks.join('');
-    } catch (error) {
-      await cancelReader();
-
-      if (error instanceof YaneIntegrationError) throw error;
-
-      throw new YaneIntegrationError(
-        'Falha ao ler resposta da API Yane.',
-        {
+      const text = await response.text();
+      if (Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BODY_BYTES) {
+        throw new YaneIntegrationError('Resposta excedeu o tamanho permitido.', {
           status: Number.isInteger(response.status) ? response.status : null,
-          code: 'YANE_RESPONSE_READ_ERROR',
-          retryable: false,
-          endpoint,
-          method,
-          correlationId,
-          requestId,
-          cause: error,
-        }
-      );
+          code: 'YANE_RESPONSE_TOO_LARGE', retryable: false,
+          endpoint, method, correlationId, requestId,
+        });
+      }
+      return text;
+    } catch (error) {
+      if (error instanceof YaneIntegrationError) throw error;
+      throw new YaneIntegrationError('Falha ao ler resposta.', {
+        status: Number.isInteger(response.status) ? response.status : null,
+        code: 'YANE_RESPONSE_READ_ERROR', retryable: false,
+        endpoint, method, correlationId, requestId, cause: error,
+      });
     }
   }
 
-  async requestJson(endpoint, options = {}) {
-    const response = await this.request(endpoint, options);
-    const metadata = this._getResponseMetadata(response);
-
-    return this.parseJson(response, {
-      correlationId:
-        options.correlationId || metadata.correlationId || null,
-      endpoint,
-      method: options.method || 'GET',
-      requestId: metadata.requestId || null,
-    });
-  }
-
-  async parseJson(
-    response,
-    { endpoint = null, method = null, correlationId = null, requestId = null } = {}
-  ) {
-    const metadata = this._getResponseMetadata(response);
+  async _parseJson(response, { endpoint, method, correlationId, requestId } = {}) {
+    const metadata = this._responseMetadata.get(response) || {};
     const resolvedCorrelationId = correlationId || metadata.correlationId || null;
     const resolvedRequestId = requestId || metadata.requestId || null;
-
     const contentType = response?.headers?.get?.('content-type') || '';
 
-    const text = await this.readResponseText(response, {
-      endpoint,
-      method,
+    const text = await this._readResponseText(response, {
+      endpoint, method,
       correlationId: resolvedCorrelationId,
       requestId: resolvedRequestId,
     });
 
     if (!clean(text)) return {};
 
-    if (isJsonContentType(contentType)) {
+    if (clean(contentType).toLowerCase().includes('json')) {
       try {
         return JSON.parse(text);
       } catch (error) {
-        throw new YaneIntegrationError(
-          'A API Yane respondeu JSON inválido.',
-          {
-            status: Number.isInteger(response?.status)
-              ? response.status
-              : null,
-            code: 'YANE_INVALID_JSON',
-            retryable: false,
-            endpoint,
-            method,
-            correlationId: resolvedCorrelationId,
-            requestId: resolvedRequestId,
-            cause: error,
-          }
-        );
-      }
-    }
-
-    try {
-      return JSON.parse(text);
-    } catch (_) {
-      return { response: text };
-    }
-  }
-
-  // ===========================================================================
-  // COMPATIBILIDADE COM BaseService
-  // ===========================================================================
-
-  handleIntegrationError(error, context) {
-    this.logError(`${context || 'Yane'} falhou.`, error);
-
-    if (typeof this.handleError === 'function') {
-      try {
-        const handled = this.handleError(error, context);
-        return handled || error;
-      } catch (handlingError) {
-        this.logWarn('handleError() do BaseService falhou.', {
-          context,
-          error: handlingError?.message || String(handlingError),
+        throw new YaneIntegrationError('JSON inválido.', {
+          status: Number.isInteger(response?.status) ? response.status : null,
+          code: 'YANE_INVALID_JSON', retryable: false,
+          endpoint, method,
+          correlationId: resolvedCorrelationId,
+          requestId: resolvedRequestId, cause: error,
         });
       }
     }
 
+    try { return JSON.parse(text); } catch (_) { return { response: text }; }
+  }
+
+  handleIntegrationError(error, context) {
+    this.logError(`${context || 'Yane'} falhou.`, error);
     return error;
   }
 
   // ===========================================================================
-  // ENTREVISTA
+  // ENTREVISTA — TURNO
   // ===========================================================================
 
   async sendInterviewTurn({
-    interviewId,
-    phone,
-    message,
-    turnId,
-    messageId,
-    isButton = false,
-    correlationId = null,
+    interviewId, phone, message, turnId, messageId, isButton = false, correlationId = null,
   }) {
-    const normalizedInterviewId = clean(interviewId);
-    const normalizedPhone = clean(phone);
-    const normalizedMessage = clean(message);
-    const normalizedTurnId = clean(turnId);
-    const normalizedMessageId = clean(messageId);
+    const iid = clean(interviewId);
+    const p = clean(phone);
+    const m = clean(message);
+    const t = clean(turnId);
+    const mid = clean(messageId);
 
-    if (!normalizedInterviewId) {
-      throw new YaneIntegrationError('interviewId é obrigatório.', {
-        code: 'INVALID_INTERVIEW_ID',
-        retryable: false,
-      });
-    }
+    if (!iid) throw new YaneIntegrationError('interviewId é obrigatório.', {
+      code: 'INVALID_INTERVIEW_ID', retryable: false,
+    });
+    if (!p) throw new YaneIntegrationError('phone é obrigatório.', {
+      code: 'INVALID_TURN_PHONE', retryable: false,
+    });
+    if (!m) throw new YaneIntegrationError('message é obrigatório.', {
+      code: 'INVALID_TURN_MESSAGE', retryable: false,
+    });
+    if (!t) throw new YaneIntegrationError('turnId é obrigatório.', {
+      code: 'INVALID_TURN_ID', retryable: false,
+    });
 
-    if (!normalizedPhone) {
-      throw new YaneIntegrationError('phone é obrigatório.', {
-        code: 'INVALID_TURN_PHONE',
-        retryable: false,
-      });
-    }
-
-    if (!normalizedMessage) {
-      throw new YaneIntegrationError('message é obrigatório.', {
-        code: 'INVALID_TURN_MESSAGE',
-        retryable: false,
-      });
-    }
-
-    if (!normalizedTurnId) {
-      throw new YaneIntegrationError(
-        'turnId é obrigatório para manter idempotência.',
-        { code: 'INVALID_TURN_ID', retryable: false }
-      );
-    }
-
-    const endpoint = ENDPOINTS.interviewTurn(normalizedInterviewId);
+    const endpoint = ENDPOINTS.interviewTurn(iid);
 
     const payload = {
-      phone: normalizedPhone,
-      message: normalizedMessage,
-      turn_id: normalizedTurnId,
+      phone: p,
+      message: m,
+      turn_id: t,
       is_button: Boolean(isButton),
     };
-
-    if (normalizedMessageId) {
-      payload.message_id = normalizedMessageId;
-    }
+    if (mid) payload.message_id = mid;
 
     const response = await this.request(endpoint, {
       method: 'POST',
       body: payload,
       timeoutMs: this.timeouts.turn,
-      idempotencyKey: normalizedTurnId,
+      idempotencyKey: t,
       correlationId,
       logLabel: 'YANE TURN',
-      logContext: {
-        interviewId: normalizedInterviewId,
-        phone: normalizedPhone,
-        turnId: normalizedTurnId,
-        messageId: normalizedMessageId || null,
-      },
+      logContext: { interviewId: iid, phone: p, turnId: t, messageId: mid || null },
     });
 
-    const metadata = this._getResponseMetadata(response);
-
-    return this.parseJson(response, {
-      endpoint,
-      method: 'POST',
-      correlationId:
-        metadata.correlationId || correlationId || null,
-      requestId: metadata.requestId || null,
-    });
-  }
-
-  async cancelInterview(
-    interviewId,
-    reason = 'candidate_reset',
-    { correlationId = null } = {}
-  ) {
-    const normalizedInterviewId = clean(interviewId);
-
-    if (!normalizedInterviewId) {
-      throw new YaneIntegrationError('interviewId é obrigatório.', {
-        code: 'INVALID_INTERVIEW_ID',
-        retryable: false,
-      });
-    }
-
-    const normalizedReason = clean(reason) || 'candidate_reset';
-    const endpoint = ENDPOINTS.interviewCancel(normalizedInterviewId);
-
-    const response = await this.request(endpoint, {
-      method: 'POST',
-      body: { reason: normalizedReason },
-      timeoutMs: this.timeouts.default,
-      idempotencyKey: `cancel:${normalizedInterviewId}`,
-      correlationId,
-      logLabel: 'YANE CANCEL',
-      logContext: {
-        interviewId: normalizedInterviewId,
-        reason: normalizedReason,
-      },
-      suppressErrorLog: [404, 405],
-    });
-
-    const metadata = this._getResponseMetadata(response);
-
-    return this.parseJson(response, {
-      endpoint,
-      method: 'POST',
-      correlationId:
-        metadata.correlationId || correlationId || null,
-      requestId: metadata.requestId || null,
-    });
+    return this._parseJson(response, { endpoint, method: 'POST', correlationId });
   }
 
   // ===========================================================================
-  // [FIX-ROUTING-1] RESOLVE INBOUND
+  // ENTREVISTA — LOOKUP
   // ===========================================================================
 
-  /**
-   * Determina a que entrevista pertence uma mensagem inbound.
-   *
-   * Este é o método central do routing multi-entrevista. Quando o
-   * mesmo telefone tem várias entrevistas activas, o backend decide
-   * qual delas é a correcta com base em:
-   *   1. replied_to_message_id (reply-to)
-   *   2. única activa
-   *   3. match de conteúdo
-   *   4. sessão recente
-   *   5. ambíguo → devolve candidatos
-   *
-   * Contrato de resposta:
-   *   {
-   *     interview_id: string | null,
-   *     confidence: 'high' | 'medium' | 'ambiguous' | 'none' | 'invalid_phone',
-   *     method: string | null,
-   *     candidates: [{ index, interview_id, job_title, company_name, score }]
-   *   }
-   *
-   * @param {object} params
-   * @param {string} params.phone
-   * @param {string} params.message
-   * @param {string|null} [params.repliedToMessageId]
-   * @param {string|null} [params.correlationId]
-   * @returns {Promise<object>}
-   */
-  async resolveInboundMessage({
-    phone,
-    message,
-    repliedToMessageId = null,
-    correlationId = null,
-  }) {
-    const normalizedPhone = clean(phone);
-    const normalizedMessage = clean(message);
-    const normalizedReply = clean(repliedToMessageId);
+  async findActiveInterviewByPhone(phone, { correlationId = null } = {}) {
+    const p = clean(phone);
+    if (!p) return null;
 
-    if (!normalizedPhone) {
-      throw new YaneIntegrationError('phone é obrigatório.', {
-        code: 'INVALID_RESOLVE_PHONE',
-        retryable: false,
-      });
-    }
-
-    if (!normalizedMessage) {
-      throw new YaneIntegrationError('message é obrigatório.', {
-        code: 'INVALID_RESOLVE_MESSAGE',
-        retryable: false,
-      });
-    }
-
-    const endpoint = ENDPOINTS.resolveInbound;
-
-    const payload = {
-      phone: normalizedPhone,
-      message: normalizedMessage,
-    };
-
-    if (normalizedReply) {
-      payload.replied_to_message_id = normalizedReply;
-    }
-
-    const response = await this.request(endpoint, {
-      method: 'POST',
-      body: payload,
-      timeoutMs: this.timeouts.lookup,
-      correlationId,
-      logLabel: 'YANE RESOLVE',
-      logContext: {
-        phone: normalizedPhone,
-        hasReply: Boolean(normalizedReply),
-      },
-      suppressErrorLog: [404],
-    });
-
-    const metadata = this._getResponseMetadata(response);
-
-    const parsed = await this.parseJson(response, {
-      endpoint,
-      method: 'POST',
-      correlationId:
-        metadata.correlationId || correlationId || null,
-      requestId: metadata.requestId || null,
-    });
-
-    // Normalização defensiva: garante que o caller encontra
-    // sempre as chaves esperadas, mesmo se o backend devolver
-    // um payload ligeiramente diferente.
-    return {
-      interview_id:
-        parsed?.interview_id || null,
-      confidence:
-        clean(parsed?.confidence) || 'none',
-      method:
-        clean(parsed?.method) || null,
-      candidates:
-        Array.isArray(parsed?.candidates)
-          ? parsed.candidates
-          : [],
-      scores:
-        parsed?.scores && typeof parsed.scores === 'object'
-          ? parsed.scores
-          : null,
-    };
-  }
-
-  // ===========================================================================
-  // LOOKUP POR TELEFONE (legacy)
-  // ===========================================================================
-
-  /**
-   * Devolve a entrevista activa mais recente para um telefone.
-   *
-   * @deprecated desde v9.3. Mantido apenas para compatibilidade.
-   * Prefira `resolveInboundMessage()` — este método perde
-   * entrevistas quando o mesmo telefone tem múltiplas activas.
-   */
-  async findActiveInterviewByPhone(
-    phone,
-    { correlationId = null } = {}
-  ) {
-    const normalizedPhone = clean(phone);
-    if (!normalizedPhone) return null;
-
-    const endpoint = ENDPOINTS.interviewByPhone(normalizedPhone);
+    const endpoint = ENDPOINTS.interviewByPhone(p);
 
     try {
       const response = await this.request(endpoint, {
@@ -1301,48 +646,186 @@ class YaneIntegrationService extends BaseService {
         timeoutMs: this.timeouts.lookup,
         correlationId,
         logLabel: 'YANE LOOKUP',
-        logContext: { phone: normalizedPhone },
+        logContext: { phone: p },
         suppressErrorLog: [404],
       });
 
-      const metadata = this._getResponseMetadata(response);
-
-      return this.parseJson(response, {
-        endpoint,
-        method: 'GET',
-        correlationId:
-          metadata.correlationId || correlationId || null,
-        requestId: metadata.requestId || null,
-      });
+      return this._parseJson(response, { endpoint, method: 'GET', correlationId });
     } catch (error) {
-      if (
-        error instanceof YaneIntegrationError &&
-        error.status === 404
-      ) {
+      if (error instanceof YaneIntegrationError && error.status === 404) {
         return null;
       }
-
       throw error;
     }
   }
 
   // ===========================================================================
-  // STATUS DA MENSAGEM
+  // RESOLVE INBOUND — com fallback
   // ===========================================================================
 
-  async sendMessageStatus({
-    phone,
-    messageId,
-    status = 'read',
-    correlationId = null,
+  async resolveInboundMessage({
+    phone, message, repliedToMessageId = null, correlationId = null,
   }) {
-    const normalizedPhone = clean(phone);
-    const normalizedMessageId = clean(messageId);
-    const normalizedStatus = clean(status) || 'read';
+    const p = clean(phone);
+    const m = clean(message);
+    const reply = clean(repliedToMessageId);
 
-    if (!normalizedPhone || !normalizedMessageId) {
-      return false;
+    if (!p) throw new YaneIntegrationError('phone é obrigatório.', {
+      code: 'INVALID_RESOLVE_PHONE', retryable: false,
+    });
+    if (!m) throw new YaneIntegrationError('message é obrigatório.', {
+      code: 'INVALID_RESOLVE_MESSAGE', retryable: false,
+    });
+
+    const endpoint = ENDPOINTS.resolveInbound;
+    const payload = { phone: p, message: m };
+    if (reply) payload.replied_to_message_id = reply;
+
+    let response;
+    try {
+      response = await this.request(endpoint, {
+        method: 'POST',
+        body: payload,
+        timeoutMs: this.timeouts.lookup,
+        correlationId,
+        logLabel: 'YANE RESOLVE',
+        logContext: { phone: p, hasReply: Boolean(reply) },
+        suppressErrorLog: [404, 405, 500, 501],
+      });
+    } catch (error) {
+      if (this._shouldFallbackFromResolve(error)) {
+        this.logWarn('resolve-inbound indisponível — a recorrer a by-phone.', {
+          phone: p,
+          fallbackReason: error?.code || null,
+          status: error?.status || null,
+        });
+        return this._resolveByPhoneFallback(p, { correlationId });
+      }
+      throw error;
     }
+
+    const parsed = await this._parseJson(response, {
+      endpoint, method: 'POST', correlationId,
+    });
+
+    return this._normalizeResolution(parsed);
+  }
+
+  _shouldFallbackFromResolve(error) {
+    if (!(error instanceof YaneIntegrationError)) return false;
+    if (error.status === null) return false;
+    return MISSING_ENDPOINT_STATUSES.has(error.status) || error.status === 500;
+  }
+
+  async _resolveByPhoneFallback(phone, { correlationId = null } = {}) {
+    const interview = await this.findActiveInterviewByPhone(phone, { correlationId });
+
+    const id = clean(interview?.id || interview?.interview_id || '');
+
+    if (!id) {
+      return {
+        interview_id: null,
+        confidence: 'none',
+        method: 'legacy_by_phone',
+        candidates: [],
+        scores: null,
+      };
+    }
+
+    return {
+      interview_id: id,
+      confidence: 'high',
+      method: 'legacy_by_phone',
+      candidates: [],
+      scores: null,
+    };
+  }
+
+  _normalizeResolution(parsed) {
+    if (!parsed || typeof parsed !== 'object') {
+      return {
+        interview_id: null,
+        confidence: 'none',
+        method: null,
+        candidates: [],
+        scores: null,
+      };
+    }
+
+    const candidates = Array.isArray(parsed.candidates)
+      ? parsed.candidates
+          .filter((c) => c && typeof c === 'object')
+          .map((c) => ({
+            index: Number.isFinite(Number(c.index)) ? Number(c.index) : null,
+            interview_id: clean(c.interview_id) || null,
+            job_title: clean(c.job_title) || '',
+            company_name: clean(c.company_name) || '',
+            score: Number.isFinite(Number(c.score)) ? Number(c.score) : null,
+          }))
+      : [];
+
+    return {
+      interview_id: clean(parsed.interview_id) || null,
+      confidence: clean(parsed.confidence) || 'none',
+      method: clean(parsed.method) || null,
+      candidates,
+      scores: parsed.scores && typeof parsed.scores === 'object' ? parsed.scores : null,
+    };
+  }
+
+  // ===========================================================================
+  // CANCELAR — tolerante a endpoint inexistente
+  // ===========================================================================
+
+  async cancelInterview(interviewId, reason = 'candidate_reset', { correlationId = null } = {}) {
+    const iid = clean(interviewId);
+    const r = clean(reason) || 'candidate_reset';
+
+    if (!iid) {
+      throw new YaneIntegrationError('interviewId é obrigatório.', {
+        code: 'INVALID_INTERVIEW_ID', retryable: false,
+      });
+    }
+
+    const endpoint = ENDPOINTS.interviewCancel(iid);
+
+    try {
+      const response = await this.request(endpoint, {
+        method: 'POST',
+        body: { reason: r },
+        timeoutMs: this.timeouts.default,
+        idempotencyKey: `cancel:${iid}`,
+        correlationId,
+        logLabel: 'YANE CANCEL',
+        logContext: { interviewId: iid, reason: r },
+        suppressErrorLog: [404, 405, 501],
+      });
+
+      return this._parseJson(response, { endpoint, method: 'POST', correlationId });
+    } catch (error) {
+      if (
+        error instanceof YaneIntegrationError &&
+        MISSING_ENDPOINT_STATUSES.has(error.status)
+      ) {
+        this.logWarn('cancel-interview indisponível — ignorado.', {
+          interviewId: iid, status: error.status,
+        });
+        return { success: true, skipped: true, reason: 'endpoint_unavailable' };
+      }
+      throw error;
+    }
+  }
+
+  // ===========================================================================
+  // STATUS DE MENSAGEM
+  // ===========================================================================
+
+  async sendMessageStatus({ phone, messageId, status = 'read', correlationId = null }) {
+    const p = clean(phone);
+    const mid = clean(messageId);
+    const s = clean(status) || 'read';
+
+    if (!p || !mid) return false;
 
     const endpoint = ENDPOINTS.messageStatus;
 
@@ -1350,41 +833,26 @@ class YaneIntegrationService extends BaseService {
       const response = await this.request(endpoint, {
         method: 'POST',
         body: {
-          phone: normalizedPhone,
-          message_id: normalizedMessageId,
-          status: normalizedStatus,
+          phone: p,
+          message_id: mid,
+          status: s,
           timestamp: new Date().toISOString(),
         },
         timeoutMs: this.timeouts.status,
-        idempotencyKey: normalizedMessageId,
+        idempotencyKey: mid,
         correlationId,
         logLabel: 'YANE STATUS',
-        logContext: {
-          phone: normalizedPhone,
-          messageId: normalizedMessageId,
-        },
+        logContext: { phone: p, messageId: mid },
         suppressErrorLog: [404, 405],
       });
 
-      const metadata = this._getResponseMetadata(response);
-
-      await this.readResponseText(response, {
-        endpoint,
-        method: 'POST',
-        correlationId:
-          metadata.correlationId || correlationId || null,
-        requestId: metadata.requestId || null,
-      });
-
+      await this._readResponseText(response, { endpoint, method: 'POST' });
       return response.ok;
     } catch (error) {
       this.logWarn('Status de mensagem não enviado.', {
-        phone: normalizedPhone,
-        messageId: normalizedMessageId,
-        code: error?.code || null,
-        status: error?.status || null,
+        phone: p, messageId: mid,
+        code: error?.code || null, status: error?.status || null,
       });
-
       return false;
     }
   }
@@ -1394,25 +862,15 @@ class YaneIntegrationService extends BaseService {
   // ===========================================================================
 
   async reportUnmatchedIncoming({
-    phone = null,
-    jid = null,
-    altJid = null,
-    message,
-    messageId = null,
-    correlationId = null,
+    phone = null, jid = null, altJid = null, message, messageId = null, correlationId = null,
   }) {
-    const normalizedPhone = clean(phone);
-    const normalizedJid = clean(jid);
-    const normalizedAltJid = clean(altJid);
-    const normalizedMessage = clean(message);
-    const normalizedMessageId = clean(messageId);
+    const p = clean(phone);
+    const j = clean(jid);
+    const a = clean(altJid);
+    const m = clean(message);
+    const mid = clean(messageId);
 
-    if (
-      (!normalizedPhone && !normalizedJid) ||
-      !normalizedMessage
-    ) {
-      return false;
-    }
+    if ((!p && !j) || !m) return false;
 
     const endpoint = ENDPOINTS.unmatchedIncoming;
 
@@ -1420,35 +878,22 @@ class YaneIntegrationService extends BaseService {
       const response = await this.request(endpoint, {
         method: 'POST',
         body: {
-          phone: normalizedPhone || null,
-          jid: normalizedJid || null,
-          alt_jid: normalizedAltJid || null,
-          message: normalizedMessage.slice(0, MAX_MESSAGE_BODY_CHARS),
-          message_id: normalizedMessageId || null,
+          phone: p || null,
+          jid: j || null,
+          alt_jid: a || null,
+          message: m.slice(0, MAX_MESSAGE_BODY_CHARS),
+          message_id: mid || null,
           received_at: new Date().toISOString(),
         },
         timeoutMs: this.timeouts.status,
-        idempotencyKey: normalizedMessageId || null,
+        idempotencyKey: mid || null,
         correlationId,
         logLabel: 'YANE UNMATCHED',
-        logContext: {
-          phone: normalizedPhone || null,
-          jid: normalizedJid || null,
-          msgId: normalizedMessageId || null,
-        },
+        logContext: { phone: p || null, jid: j || null, msgId: mid || null },
         suppressErrorLog: [404, 405],
       });
 
-      const metadata = this._getResponseMetadata(response);
-
-      await this.readResponseText(response, {
-        endpoint,
-        method: 'POST',
-        correlationId:
-          metadata.correlationId || correlationId || null,
-        requestId: metadata.requestId || null,
-      });
-
+      await this._readResponseText(response, { endpoint, method: 'POST' });
       return response.ok;
     } catch (error) {
       if (
@@ -1458,14 +903,10 @@ class YaneIntegrationService extends BaseService {
         return false;
       }
 
-      this.logWarn('Falha ao reportar mensagem órfã.', {
-        phone: normalizedPhone || null,
-        jid: normalizedJid || null,
-        msgId: normalizedMessageId || null,
-        code: error?.code || null,
-        status: error?.status || null,
+      this.logWarn('Falha ao reportar órfã.', {
+        phone: p || null, jid: j || null, msgId: mid || null,
+        code: error?.code || null, status: error?.status || null,
       });
-
       return false;
     }
   }
@@ -1483,34 +924,19 @@ class YaneIntegrationService extends BaseService {
         includeAuth: false,
         timeoutMs: this.timeouts.health,
         logLabel: 'YANE HEALTH',
+        suppressErrorLog: [404, 500, 502, 503, 504],
       });
 
-      const metadata = this._getResponseMetadata(response);
-
-      await this.readResponseText(response, {
-        endpoint,
-        method: 'GET',
-        requestId: metadata.requestId || null,
-        correlationId: metadata.correlationId || null,
-      });
-
+      await this._readResponseText(response, { endpoint, method: 'GET' });
       return response.ok;
     } catch (error) {
-      this.logWarn('Health check do backend Yane falhou.', {
-        code: error?.code || null,
-        status: error?.status || null,
-        retryable: error?.retryable || false,
-        retryAfterMs: error?.retryAfterMs ?? null,
+      this.logWarn('Health check falhou.', {
+        code: error?.code || null, status: error?.status || null,
       });
-
       return false;
     }
   }
 }
-
-// =============================================================================
-// EXPORTS
-// =============================================================================
 
 module.exports = YaneIntegrationService;
 module.exports.YaneIntegrationError = YaneIntegrationError;
