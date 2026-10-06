@@ -21,6 +21,26 @@
 //   optional chaining em _metricIncrement/_metricSet do
 //   InterviewService. A observabilidade da fila era silenciosamente
 //   inexistente.
+//
+// [FIX-QUEUE-2]  <<< NOVO >>>
+//   Declarada a métrica `workerBatches`, invocada pelo
+//   InterviewService após cada lote de telefones processado pelo
+//   worker de recuperação. Sem esta declaração, o counter ficava
+//   silenciosamente em falta e não era possível observar pressão
+//   da fila nem fracassos por lote.
+//
+//   Labels:
+//       size     — número de telefones no lote (string, para bucket)
+//       failures — número de falhas no lote (string, para bucket)
+//
+//   Para séries estáveis, os valores são convertidos para string
+//   com limites discretos (batch_size <= 24, failures <= 24). Os
+//   dashboards agregam por estes buckets discretos.
+//
+// [FIX-QUEUE-3]  <<< NOVO >>>
+//   Declarada a métrica `aggregationDepth` — profundidade do buffer
+//   de agregação por telefone. Permite ver quantas mensagens estão
+//   acumuladas à espera de flush num dado momento.
 
 const client = require('prom-client');
 
@@ -167,10 +187,9 @@ class MetricsService {
     // Fila de pendentes e dead-letter
     // ----------------------------------------------------------
     //
-    // [FIX-QUEUE-1] Antes desta revisão, o InterviewService
-    // invocava estas métricas mas elas não existiam no registry.
-    // O optional chaining fazia com que a chamada fosse ignorada
-    // silenciosamente.
+    // [FIX-QUEUE-1] Declaradas as métricas que o InterviewService
+    // invocava mas não existiam no registry. Sem isto, as chamadas
+    // caiam no vazio pelo optional chaining.
     //
     // Convenções:
     //   - kind   : 'turn' | 'delivery' | 'unknown'
@@ -211,6 +230,43 @@ class MetricsService {
     this.deadLetterDepth = new client.Gauge({
       name: 'yane_dead_letter_depth',
       help: 'Itens acumulados na dead-letter',
+      registers,
+    });
+
+    // ----------------------------------------------------------
+    // Worker de recuperação
+    // ----------------------------------------------------------
+    //
+    // [FIX-QUEUE-2] Counter invocado pelo InterviewService após
+    // cada lote de telefones processado.
+    //
+    // Labels são strings para caber em séries discretas. Os valores
+    // são o tamanho do lote (0..workerBatchSize) e o número de
+    // falhas nesse lote (0..workerBatchSize).
+    //
+    // Para o agregado global, um dashboard pode fazer:
+    //   sum(rate(yane_worker_batches_total[5m])) by (failures)
+
+    this.workerBatches = new client.Counter({
+      name: 'yane_worker_batches_total',
+      help: 'Lotes de telefones processados pelo worker de recuperação',
+      labelNames: ['size', 'failures'],
+      registers,
+    });
+
+    // ----------------------------------------------------------
+    // Agregação de mensagens
+    // ----------------------------------------------------------
+    //
+    // [FIX-QUEUE-3] Profundidade do buffer de agregação por telefone.
+    // Fica em falta a contagem de telefones com buffer aberto — a
+    // ser adicionada em revisão futura se valer a pena para
+    // dashboards.
+
+    this.aggregationDepth = new client.Gauge({
+      name: 'yane_aggregation_depth',
+      help: 'Mensagens em buffer de agregação por telefone',
+      labelNames: ['kind'],
       registers,
     });
 

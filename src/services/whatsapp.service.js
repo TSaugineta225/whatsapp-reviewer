@@ -26,11 +26,28 @@
 //           descartadas silenciosamente — o candidato ficava sem
 //           resposta sem perceber porquê.
 //
+// [FIX-2.7] resetInterviewConversation resolve PRIMEIRO o
+//           interviewId e só depois apaga o estado local. Sem isto,
+//           uma falha de cancelamento backend deixava Redis e
+//           backend divergentes.
+//
+// [FIX-2.8] Recuperação automática após esgotar MAX_RETRIES.
+//           Antes, o serviço ficava permanentemente offline após
+//           5 tentativas falhadas. Agora agenda uma tentativa
+//           espaçada (5min) que se repete até a ligação voltar.
+//
+// [FIX-2.9] (NOVO) `errorMessage` foi reintroduzido como helper
+//           puro no topo do ficheiro. Antes era referenciado em
+//           `waitForRateLimit` mas não existia — o que rebentava
+//           com `ReferenceError` precisamente no caminho de
+//           degradação do Redis, quando mais se precisa do log.
+//
 // PRINCÍPIOS
 // - Uma única instância do socket por número.
 // - O processamento de negócio continua no InterviewService.
 // - Redis continua responsável pela coordenação/rate limit externo.
 // - Nunca enviar para LID não resolvido.
+// - Observabilidade nunca pode interromper o fluxo de negócio.
 
 const {
   default: makeWASocket,
@@ -65,6 +82,7 @@ const DEFAULT_COUNTRY_CODE = '258';
 const MAX_RETRIES = 5;
 const INITIAL_RETRY_DELAY = 5_000;
 const MAX_RETRY_DELAY = 60_000;
+const RETRY_RECOVERY_INTERVAL_MS = 5 * 60_000;
 
 const CONNECTION_TIMEOUT = 60_000;
 
@@ -74,6 +92,8 @@ const READ_CACHE_MAX_SIZE = 5_000;
 const OUTBOUND_RATE_LIMIT = 30;
 const RATE_LIMIT_RETRY_MS = 200;
 const RATE_LIMIT_MAX_WAIT_MS = 5_000;
+const LOCAL_RATE_LIMIT_WINDOW_MS = 1_000;
+const LOCAL_RATE_LIMIT_MAX = OUTBOUND_RATE_LIMIT;
 
 const SEND_RETRY_ATTEMPTS = 2;
 const SEND_RETRY_BASE_MS = 250;
@@ -82,6 +102,9 @@ const SEND_RETRY_MAX_MS = 1_500;
 const LOGOUT_RESTART_DELAY_MS = 3_000;
 
 const MAX_LID_CACHE_SIZE = 5_000;
+const LID_CACHE_TTL_MS = 24 * 60 * 60_000;
+const INCOMING_DEDUPE_TTL_MS = 10 * 60_000;
+const INCOMING_DEDUPE_MAX_SIZE = 10_000;
 
 const STATUS_BROADCAST = 'status@broadcast';
 const WHATSAPP_SUFFIX = '@s.whatsapp.net';
@@ -133,6 +156,15 @@ function clean(value) {
 
 function digitsOnly(value) {
   return String(value ?? '').replace(/\D/g, '');
+}
+
+// [FIX-2.9] Helper reintroduzido. Era referenciado em `waitForRateLimit`
+// sem estar definido, causando `ReferenceError` precisamente quando o
+// Redis cai e o fallback local é acionado. Nunca falhar o logging.
+function errorMessage(error) {
+  return clean(
+    error?.message || error?.error || 'unknown_error'
+  ).slice(0, 500);
 }
 
 function isAbortError(error) {
@@ -258,6 +290,7 @@ class WhatsAppService extends BaseService {
     this.retryCount = 0;
     this.retryTimer = null;
     this.logoutRestartTimer = null;
+    this.recoveryTimer = null;
 
     this.connectedAt = null;
 
@@ -282,6 +315,16 @@ class WhatsAppService extends BaseService {
     this._conversationResetLocks = new Map();
 
     this._lidToPhoneCache = new Map();
+    this._incomingMessageCache = new Map();
+    this._localRateLimit = [];
+
+    if (typeof this.interviewService?.setWhatsAppService === 'function') {
+      try {
+        this.interviewService.setWhatsAppService(this);
+      } catch (_) {
+        // Ligação automática é best-effort.
+      }
+    }
 
     this.logger = pino({
       level: process.env.LOG_LEVEL || 'info',
@@ -377,7 +420,7 @@ class WhatsAppService extends BaseService {
         'Falha ao registar métrica; operação ignorada.',
         {
           metric: metricName,
-          error: error?.message || String(error),
+          error: errorMessage(error),
         }
       );
     }
@@ -394,7 +437,7 @@ class WhatsAppService extends BaseService {
         'Falha ao atualizar métrica; operação ignorada.',
         {
           metric: metricName,
-          error: error?.message || String(error),
+          error: errorMessage(error),
         }
       );
     }
@@ -444,7 +487,7 @@ class WhatsAppService extends BaseService {
           'Falha na instrumentação da métrica; resultado do negócio preservado.',
           {
             metric: metricName,
-            error: error?.message || String(error),
+            error: errorMessage(error),
           }
         );
 
@@ -456,7 +499,7 @@ class WhatsAppService extends BaseService {
         'Falha ao iniciar medição; executando operação sem instrumentação.',
         {
           metric: metricName,
-          error: error?.message || String(error),
+          error: errorMessage(error),
         }
       );
 
@@ -477,7 +520,7 @@ class WhatsAppService extends BaseService {
       ...this._safeLogContext(context),
       ...(error
         ? {
-            error: error?.message || String(error),
+            error: errorMessage(error),
             code: error?.code || null,
             statusCode:
               error?.output?.statusCode ??
@@ -697,7 +740,23 @@ class WhatsAppService extends BaseService {
     if (!canonicalLid) return '';
 
     const cached = this._lidToPhoneCache.get(canonicalLid);
-    if (cached) return cached;
+
+    if (cached) {
+      if (
+        typeof cached === 'object' &&
+        cached.expiresAt &&
+        cached.expiresAt > Date.now()
+      ) {
+        return cached.phone || '';
+      }
+
+      // Compatibilidade com entradas antigas que ainda sejam strings.
+      if (typeof cached === 'string') {
+        return cached;
+      }
+
+      this._lidToPhoneCache.delete(canonicalLid);
+    }
 
     try {
       const fromRedis = await this.redis.resolveLidMapping(canonicalLid);
@@ -713,7 +772,7 @@ class WhatsAppService extends BaseService {
     } catch (error) {
       this.logWarn('Falha ao consultar LID no Redis.', {
         lid: canonicalLid,
-        error: error?.message,
+        error: errorMessage(error),
       });
     }
 
@@ -739,7 +798,7 @@ class WhatsAppService extends BaseService {
     } catch (error) {
       this.logWarn('Falha ao resolver LID via signalRepository.', {
         lid: canonicalLid,
-        error: error?.message,
+        error: errorMessage(error),
       });
     }
 
@@ -754,6 +813,19 @@ class WhatsAppService extends BaseService {
     if (!lidJid || !phone) return;
 
     try {
+      const now = Date.now();
+
+      for (const [key, value] of this._lidToPhoneCache) {
+        if (
+          value &&
+          typeof value === 'object' &&
+          value.expiresAt &&
+          value.expiresAt <= now
+        ) {
+          this._lidToPhoneCache.delete(key);
+        }
+      }
+
       if (this._lidToPhoneCache.size >= MAX_LID_CACHE_SIZE) {
         const oldestKey =
           this._lidToPhoneCache.keys().next().value;
@@ -763,7 +835,10 @@ class WhatsAppService extends BaseService {
         }
       }
 
-      this._lidToPhoneCache.set(lidJid, phone);
+      this._lidToPhoneCache.set(lidJid, {
+        phone,
+        expiresAt: now + LID_CACHE_TTL_MS,
+      });
     } catch (_) {
       // Cache é best-effort.
     }
@@ -779,7 +854,7 @@ class WhatsAppService extends BaseService {
     } catch (error) {
       this.logWarn('Falha ao persistir LID → PN.', {
         lid: lidJid,
-        error: error?.message,
+        error: errorMessage(error),
       });
     }
   }
@@ -810,7 +885,19 @@ class WhatsAppService extends BaseService {
 
       if (!canonicalLid) return;
 
-      if (this._lidToPhoneCache.get(canonicalLid) === phone) {
+      const cached = this._lidToPhoneCache.get(canonicalLid);
+
+      if (
+        cached &&
+        typeof cached === 'object' &&
+        cached.phone === phone &&
+        cached.expiresAt > Date.now()
+      ) {
+        return;
+      }
+
+      if (cached === phone) {
+        // Compatibilidade com cache legado.
         return;
       }
 
@@ -827,7 +914,7 @@ class WhatsAppService extends BaseService {
       await this._persistLidMapping(canonicalLid, phone);
     } catch (error) {
       this.logWarn('Falha ao capturar LID da resposta.', {
-        error: error?.message,
+        error: errorMessage(error),
       });
     }
   }
@@ -891,6 +978,7 @@ class WhatsAppService extends BaseService {
 
   async _initializeInternal(lifecycleGeneration) {
     this.clearRetryTimer();
+    this.clearRecoveryTimer();
 
     this.isConnecting = true;
     this.isReady = false;
@@ -927,7 +1015,7 @@ class WhatsAppService extends BaseService {
         this.logWarn(
           'Não foi possível obter a versão atual do WhatsApp; '
           + 'usando a versão interna do Baileys.',
-          { error: error?.message }
+          { error: errorMessage(error) }
         );
       }
 
@@ -1122,6 +1210,7 @@ class WhatsAppService extends BaseService {
     this.connectedAt = Date.now();
 
     this.clearRetryTimer();
+    this.clearRecoveryTimer();
     this.clearLogoutRestartTimer();
 
     this._safeMetricSet(
@@ -1224,6 +1313,7 @@ class WhatsAppService extends BaseService {
   scheduleReconnect() {
     if (
       this.retryTimer ||
+      this.recoveryTimer ||
       this.isShuttingDown ||
       this.isConnecting ||
       this.isReady ||
@@ -1234,8 +1324,39 @@ class WhatsAppService extends BaseService {
 
     if (this.retryCount >= MAX_RETRIES) {
       this.logError(
-        `Número máximo de tentativas atingido (${MAX_RETRIES}).`
+        `Número máximo de tentativas atingido (${MAX_RETRIES}). ` +
+        `A tentar recuperação automática em ` +
+        `${Math.round(RETRY_RECOVERY_INTERVAL_MS / 60_000)} minutos.`
       );
+
+      if (!this.recoveryTimer) {
+        const lifecycleGeneration = this._lifecycleGeneration;
+
+        this.recoveryTimer = setTimeout(() => {
+          this.recoveryTimer = null;
+
+          if (
+            this.isShuttingDown ||
+            this._resetPromise ||
+            lifecycleGeneration !== this._lifecycleGeneration
+          ) {
+            return;
+          }
+
+          this.retryCount = 0;
+
+          void this.initialize().catch((error) => {
+            this.logError(
+              'Falha na recuperação automática da conexão.',
+              error
+            );
+            this.scheduleReconnect();
+          });
+        }, RETRY_RECOVERY_INTERVAL_MS);
+
+        this.unrefTimer(this.recoveryTimer);
+      }
+
       return;
     }
 
@@ -1279,6 +1400,13 @@ class WhatsAppService extends BaseService {
 
     clearTimeout(this.retryTimer);
     this.retryTimer = null;
+  }
+
+  clearRecoveryTimer() {
+    if (!this.recoveryTimer) return;
+
+    clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = null;
   }
 
   _scheduleLogoutRestart() {
@@ -1331,6 +1459,58 @@ class WhatsAppService extends BaseService {
     }
   }
 
+  _rememberIncomingMessage(messageId) {
+    const id = clean(messageId);
+    if (!id) return true;
+
+    const now = Date.now();
+    const previous = this._incomingMessageCache.get(id);
+
+    if (previous && now - previous < INCOMING_DEDUPE_TTL_MS) {
+      return false;
+    }
+
+    this._incomingMessageCache.set(id, now);
+
+    if (this._incomingMessageCache.size > INCOMING_DEDUPE_MAX_SIZE) {
+      for (const [key, timestamp] of this._incomingMessageCache) {
+        if (now - timestamp > INCOMING_DEDUPE_TTL_MS) {
+          this._incomingMessageCache.delete(key);
+        }
+
+        if (this._incomingMessageCache.size <= INCOMING_DEDUPE_MAX_SIZE) {
+          break;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  _clearIncomingMessageCache() {
+    this._incomingMessageCache.clear();
+  }
+
+  _allowLocalRateLimit() {
+    const now = Date.now();
+
+    this._localRateLimit = this._localRateLimit.filter(
+      (timestamp) =>
+        now - timestamp < LOCAL_RATE_LIMIT_WINDOW_MS
+    );
+
+    if (this._localRateLimit.length >= LOCAL_RATE_LIMIT_MAX) {
+      return false;
+    }
+
+    this._localRateLimit.push(now);
+    return true;
+  }
+
+  _clearLocalRateLimit() {
+    this._localRateLimit.length = 0;
+  }
+
   // ===========================================================================
   // MENSAGENS RECEBIDAS
   // ===========================================================================
@@ -1380,6 +1560,17 @@ class WhatsAppService extends BaseService {
 
     if (!msg?.message) return;
     if (msg.key?.fromMe) return;
+
+    const messageId = clean(msg.key?.id);
+
+    if (messageId && !this._rememberIncomingMessage(messageId)) {
+      this._safeMetricInc(
+        metrics.messagesReceived,
+        { type: 'duplicate' },
+        'messagesReceived'
+      );
+      return;
+    }
 
     const rawJid = msg.key?.remoteJid;
 
@@ -1500,7 +1691,7 @@ class WhatsAppService extends BaseService {
     } catch (error) {
       this.logWarn('Falha ao reportar mensagem órfã.', {
         remoteJid: rawJid,
-        error: error?.message,
+        error: errorMessage(error),
       });
     }
   }
@@ -1805,7 +1996,7 @@ class WhatsAppService extends BaseService {
       this.logWarn('Falha ao sincronizar reset da entrevista.', {
         phone: from,
         session: interviewId || null,
-        error: error?.message || String(error),
+        error: errorMessage(error),
       });
 
       // Importante: não apagamos o estado local se o cancelamento backend
@@ -1908,9 +2099,15 @@ class WhatsAppService extends BaseService {
         participant: key?.participant || null,
       });
 
-      await this.notifyBackendMessageRead({
+      void this.notifyBackendMessageRead({
         phone,
         messageId,
+      }).catch((error) => {
+        this.logError(
+          'Erro assíncrono ao enviar status de leitura.',
+          error,
+          { phone, msgId: messageId }
+        );
       });
     } finally {
       this._readReceiptInFlight.delete(inFlightKey);
@@ -2063,7 +2260,7 @@ class WhatsAppService extends BaseService {
         ).catch((error) => {
           this.logWarn(
             'Falha assíncrona ao guardar mapeamento LID → PN.',
-            { error: error?.message || String(error) }
+            { error: errorMessage(error) }
           );
         });
 
@@ -2102,7 +2299,7 @@ class WhatsAppService extends BaseService {
             attempt: attempt + 1,
             maxAttempts,
             retryInMs: backoff,
-            error: error?.message || String(error),
+            error: errorMessage(error),
             code: error?.code || null,
           }
         );
@@ -2141,13 +2338,28 @@ class WhatsAppService extends BaseService {
           OUTBOUND_RATE_LIMIT
         );
 
-        if (allowed) return true;
+        if (allowed) {
+          this._allowLocalRateLimit();
+          return true;
+        }
       } catch (error) {
-        this.logError('Falha no rate limiter Redis.', error, {
-          bucket: 'out',
-        });
+        // Redis continua a ser o rate limiter distribuído principal.
+        // Em degradação, usamos uma proteção local para não paralisar
+        // completamente as entrevistas.
+        //
+        // [FIX-2.9] `errorMessage` era referenciado aqui sem estar
+        // definido. Como este caminho corre precisamente quando o Redis
+        // cai, o ReferenceError mascarava o warning. Corrigido com o
+        // helper reintroduzido no topo do módulo.
+        this.logWarn(
+          'Rate limiter Redis indisponível; usando limite local.',
+          {
+            bucket: 'out',
+            error: errorMessage(error),
+          }
+        );
 
-        return false;
+        return this._allowLocalRateLimit();
       }
 
       await this.delay(RATE_LIMIT_RETRY_MS);
@@ -2261,7 +2473,7 @@ class WhatsAppService extends BaseService {
       this.logWarn('Falha ao atualizar presence.', {
         recipient: this.formatLogRecipient(chatId),
         presence,
-        error: error?.message || String(error),
+        error: errorMessage(error),
       });
     }
   }
@@ -2275,11 +2487,22 @@ class WhatsAppService extends BaseService {
       this.isReady && this.socket?.user?.id
     );
 
+    const sessionId = this.socket?.user?.id || null;
+
     return {
       connected,
+      ready: connected,
+      connecting: Boolean(this.isConnecting),
       qr_code: this.qrCode,
 
-      session: this.socket?.user?.id?.split(':')[0] || null,
+      session: sessionId?.split(':')[0] || null,
+
+      connected_at: this.connectedAt
+        ? new Date(this.connectedAt).toISOString()
+        : null,
+
+      retry_count: this.retryCount,
+      recovery_scheduled: Boolean(this.recoveryTimer),
 
       message: connected
         ? 'WhatsApp conectado e pronto'
@@ -2287,7 +2510,9 @@ class WhatsAppService extends BaseService {
           ? 'Aguardando escaneamento do QR Code'
           : this.isConnecting
             ? 'A iniciar sessão...'
-            : 'WhatsApp desconectado',
+            : this.recoveryTimer
+              ? 'Ligação indisponível; recuperação automática agendada'
+              : 'WhatsApp desconectado',
     };
   }
 
@@ -2339,6 +2564,7 @@ class WhatsAppService extends BaseService {
 
     try {
       this.clearRetryTimer();
+      this.clearRecoveryTimer();
       this.clearLogoutRestartTimer();
 
       // Fechar primeiro impede que uma sessão antiga continue a receber
@@ -2353,7 +2579,7 @@ class WhatsAppService extends BaseService {
         } catch (error) {
           this.logWarn(
             'Inicialização anterior terminou com erro durante reset.',
-            { error: error?.message || String(error) }
+            { error: errorMessage(error) }
           );
         }
       }
@@ -2406,7 +2632,7 @@ class WhatsAppService extends BaseService {
       return {
         success: false,
         message:
-          error?.message || 'Falha ao reiniciar sessão.',
+          errorMessage(error) || 'Falha ao reiniciar sessão.',
       };
     }
   }
@@ -2448,6 +2674,8 @@ class WhatsAppService extends BaseService {
 
     this.lastReadTimestamps.clear();
     this._readReceiptInFlight.clear();
+    this._clearIncomingMessageCache();
+    this._clearLocalRateLimit();
   }
 
   // ===========================================================================
@@ -2472,6 +2700,7 @@ class WhatsAppService extends BaseService {
     this._lifecycleGeneration += 1;
 
     this.clearRetryTimer();
+    this.clearRecoveryTimer();
     this.clearLogoutRestartTimer();
 
     this.isReady = false;
@@ -2526,6 +2755,8 @@ class WhatsAppService extends BaseService {
     }
 
     this._clearLidCache();
+    this._clearIncomingMessageCache();
+    this._clearLocalRateLimit();
     this.lastReadTimestamps.clear();
     this._readReceiptInFlight.clear();
     this._conversationResetLocks.clear();

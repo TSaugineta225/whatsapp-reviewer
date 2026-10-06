@@ -33,7 +33,7 @@
 // [FIX-ROUTING-4]
 //   Cache local `resolved:<phone>` com TTL 5min.
 //
-// [FIX-HONESTY-1]  <<< NOVO >>>
+// [FIX-HONESTY-1]
 //   startInterview deixa de devolver success:true quando o convite
 //   nem foi enviado nem enfileirado. O backend Python só verifica
 //   `success`, por isso mentir aqui causava entrevistas registadas
@@ -41,22 +41,46 @@
 //   Campo novo: `delivered` / `queued` / `delivery_pending` para o
 //   backend distinguir os três estados.
 //
-// [FIX-ROUTING-LOCAL]  <<< NOVO >>>
+// [FIX-ROUTING-LOCAL]
 //   _resolveInterviewForIncoming volta a consultar o mapping local
 //   (`interview:<phone>`) ANTES de tentar o backend. Este atalho é
 //   O(1), foi escrito pelo próprio startInterview, e é a diferença
-//   entre o bot responder ou não ao candidato. A versão anterior
-//   tinha-o perdido — só consultava a cache `resolved:<phone>`,
-//   que nada preenche durante o convite.
+//   entre o bot responder ou não ao candidato.
 //
-// [FIX-BOOT-DIAG]  <<< NOVO >>>
+// [FIX-BOOT-DIAG]
 //   _initialize avisa explicitamente quando o InterviewService arranca
-//   sem WhatsAppService ligado. Sem este aviso, os convites ficavam
-//   silenciosamente em fila sem que ninguém percebesse.
+//   sem WhatsAppService ligado.
 //
-// [FIX-CAP-3]  <<< NOVO >>>
+// [FIX-CAP-3]
 //   _assertYaneCapabilities valida também `cancelInterview`, porque o
 //   WhatsAppService o usa no !reset do candidato.
+//
+// [FIX-AGGREGATION-1]  <<< NOVO >>>
+//   Agregação de mensagens consecutivas do mesmo candidato.
+//
+//   Contexto: WhatsApp é um meio fragmentado. O candidato escreve
+//   "Acho que não", pausa, "Não tenho mais nada", pausa, "De que se
+//   eu disse que não tenho nada". Antes deste fix, cada mensagem era
+//   um turno — o motor conversacional via 3 respostas onde devia ver
+//   uma, gerava 3 perguntas desligadas do conteúdo e fragmentava o
+//   transcript.
+//
+//   Solução: quando chega a primeira mensagem do telefone, abre-se
+//   uma janela curta (~2.5s) e o processamento é adiado. Mensagens
+//   que cheguem durante a janela são acumuladas no mesmo buffer.
+//   Quando a janela fecha (ou o buffer enche), o conteúdo combinado
+//   entra no pipeline normal — dedup, lock, resolve-inbound e POST
+//   ao backend — como um único turno.
+//
+//   O buffer é em memória. Se o processo Node reiniciar entre a
+//   primeira e a última mensagem, perde-se a acumulação parcial —
+//   a primeira mensagem fica sem resposta e as seguintes abrem um
+//   buffer novo. Aceitável para MVP; o processo só reinicia em
+//   deploy ou crash.
+//
+//   A `_handleAggregatedTurn` reutiliza exactamente o mesmo pipeline
+//   de `handleIncomingMessage` na versão anterior, apenas com o
+//   texto combinado e o `messageId` da última mensagem.
 
 'use strict';
 
@@ -72,8 +96,11 @@ const metrics = require('./metrics.service');
 // =============================================================================
 
 const CONFIG = Object.freeze({
-  typingMsPerChar: 22,
-  typingMaxMs: 2_600,
+  // Simulação humana sem transformar a entrega numa segunda espera de IA.
+  typingMsPerChar: 11,
+  typingMinMs: 140,
+  typingMaxMs: 1_400,
+  typingLongMessageThreshold: 90,
 
   pendingPhonesKey: 'pending:phones',
   pendingTurnKeyPrefix: 'pending:turn',
@@ -87,8 +114,11 @@ const CONFIG = Object.freeze({
   backoffMaxMs: 15 * 60_000,
   deadLetterRetryMs: 60 * 60_000,
 
-  workerIntervalMs: 10_000,
-  workerBatchSize: 20,
+  // O worker continua conservador por telefone, mas processa telefones
+  // independentes em paralelo. Isso reduz o efeito "uma fila trava todas".
+  workerIntervalMs: 5_000,
+  workerBatchSize: 24,
+  workerConcurrency: 6,
   workerMaxPerPhone: 3,
 
   lockTtlSeconds: 300,
@@ -110,6 +140,32 @@ const CONFIG = Object.freeze({
 
   disambiguationTtlSeconds: 5 * 60,
   resolvedInterviewTtlSeconds: 5 * 60,
+
+  // [FIX-AGGREGATION-1] Agregação de mensagens consecutivas.
+  //
+  // WhatsApp é fragmentado. Sem agregação, cada mensagem curta vira
+  // um turno completo — o motor conversacional vê N respostas onde
+  // devia ver uma, gera N perguntas e fragmenta o transcript.
+  //
+  // aggregationWindowMs:
+  //   Tempo de espera a contar do ÚLTIMO reinicio do timer. Se o
+  //   candidato continua a escrever, o timer reinicia — só dispara
+  //   quando há uma pausa real.
+  //
+  // aggregationMaxWaitMs:
+  //   Tempo máximo desde a PRIMEIRA mensagem do buffer. Impede
+  //   espera infinita se o candidato não faz pausas.
+  //
+  // aggregationMaxMessages / aggregationMaxChars:
+  //   Limites de segurança para não acumular indefinidamente.
+  //   Ao atingir qualquer um, força flush imediato.
+  // Espera curta para juntar mensagens fragmentadas, mas sem introduzir
+  // uma espera perceptível em todas as respostas.
+  aggregationWindowMs: 1_200,
+  aggregationFastWindowMs: 650,
+  aggregationMaxWaitMs: 4_500,
+  aggregationMaxMessages: 6,
+  aggregationMaxChars: 4_000,
 });
 
 const REQUIRED_YANE_METHODS = Object.freeze([
@@ -128,7 +184,8 @@ const REQUIRED_YANE_METHODS = Object.freeze([
 
 function clean(value) {
   return String(value ?? '')
-    .replace(/^["'`]+|["'`]+$ /g, '')
+    .replace(/^\s*["'`]+|["'`]+\s*$/g, '')
+    .replace(/\r\n/g, '\n')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{4,}/g, '\n\n')
     .trim();
@@ -182,6 +239,24 @@ function getRetryAfterMs(error) {
 
 function isRetryableError(error) {
   if (typeof error?.retryable === 'boolean') return error.retryable;
+
+  const status = Number(error?.status || error?.statusCode);
+  if (Number.isFinite(status)) {
+    if ([408, 409, 425, 429].includes(status)) return true;
+    if (status >= 400 && status < 500) return false;
+  }
+
+  const code = clean(error?.code).toLowerCase();
+  if (
+    code.includes('validation') ||
+    code.includes('invalid_payload') ||
+    code.includes('unauthorized') ||
+    code.includes('forbidden') ||
+    code.includes('not_found')
+  ) {
+    return false;
+  }
+
   return true;
 }
 
@@ -212,8 +287,16 @@ class InterviewService {
       )
     );
 
-    this.typingMax = Math.max(
+    this.typingMin = Math.max(
       0,
+      safeNumber(
+        process.env.WHATSAPP_TYPING_MIN_MS,
+        CONFIG.typingMinMs
+      )
+    );
+
+    this.typingMax = Math.max(
+      this.typingMin,
       safeNumber(
         process.env.WHATSAPP_TYPING_MAX_MS,
         CONFIG.typingMaxMs
@@ -234,6 +317,19 @@ class InterviewService {
 
     this._fallbackSentAt = new Map();
     this._fallbackInFlight = new Set();
+
+    // [FIX-AGGREGATION-1] Buffer de agregação por telefone.
+    //
+    // Estrutura: phone → {
+    //   messages: string[],
+    //   ids:      string[],
+    //   replies:  (string|null)[],
+    //   buttons:  boolean[],
+    //   firstAt:  number,     // timestamp da primeira mensagem do buffer
+    //   timer:    Timeout|null,
+    //   flushing: boolean,
+    // }
+    this._aggregationBuffers = new Map();
 
     this.logger = pino({
       level: process.env.LOG_LEVEL || 'info',
@@ -447,6 +543,11 @@ class InterviewService {
 
     this._closing = true;
     ++this._lifecycleGeneration;
+
+    // [FIX-AGGREGATION-1] Cancelar todos os buffers pendentes antes de
+    // qualquer outra operação. Sem isto, um timer dispararia no meio do
+    // shutdown e tentaria enviar para um socket já fechado.
+    this._clearAllAggregationBuffers();
 
     this._stopWorker();
 
@@ -728,9 +829,6 @@ class InterviewService {
   // ===========================================================================
 
   // [FIX-HONESTY-1] Devolve a verdade ao backend.
-  // `delivered` → mensagem saiu agora
-  // `queued`    → ficou em fila, worker entrega depois
-  // (nem um nem outro) → success:false
   async startInterview(payload = {}) {
     const phone = normalizePhone(payload.phone);
 
@@ -762,6 +860,11 @@ class InterviewService {
     // acabou de receber um novo convite.
     await this._clearResolvedInterview(phone);
 
+    // [FIX-AGGREGATION-1] Limpar buffer de agregação pendente. Se o
+    // candidato tinha buffers a meio de uma entrevista anterior, não
+    // devem contaminar a nova.
+    this._clearAggregationBuffer(phone);
+
     const delivery = await this._sendText(phone, initialMessage);
 
     if (delivery.ok) {
@@ -785,7 +888,6 @@ class InterviewService {
     });
 
     if (queued !== 1) {
-      // Nem enviou nem enfileirou — dizer a verdade.
       this._metricIncrement('errorsTotal', { subsystem: 'redis' });
       await this._safeSendFallback(phone);
 
@@ -795,6 +897,11 @@ class InterviewService {
         phone,
         { interviewId, queued }
       );
+
+      // O convite não foi entregue nem preservado na fila. Não deixamos
+      // um mapping activo para uma entrevista que o candidato não recebeu.
+      await this.forgetInterview(phone);
+      await this._clearResolvedInterview(phone);
 
       return {
         success: false,
@@ -820,10 +927,40 @@ class InterviewService {
     };
   }
 
+  _isImmediateMessage({ message, isButton = false }) {
+    if (isButton) return true;
+
+    const value = clean(message);
+    if (!value) return false;
+
+    // Escolha de disambiguação e comandos de saída não devem esperar
+    // a janela de agregação.
+    if (/^\d{1,2}$/.test(value)) return true;
+    if (/^(cancelar|desistir|desisto|parar|sair|encerrar)(?:\s+(?:a\s+)?entrevista)?[.!?]*$/i.test(value)) {
+      return true;
+    }
+
+    return false;
+  }
+
   // ===========================================================================
   // MENSAGEM RECEBIDA
   // ===========================================================================
 
+  /**
+   * Ponto de entrada de uma mensagem inbound.
+   *
+   * [FIX-AGGREGATION-1] Já não processa imediatamente. Entrega a
+   * mensagem ao buffer de agregação por telefone. Se for a primeira
+   * mensagem do candidato numa janela curta (~2.5s), abre o buffer e
+   * agenda o flush. Se for uma mensagem adicional na mesma janela,
+   * acumula no mesmo buffer. Quando o timer dispara, o conteúdo
+   * combinado entra em `_handleAggregatedTurn`, que corre o pipeline
+   * normal — dedup, lock, resolve-inbound e POST ao backend.
+   *
+   * Devolve imediatamente um ack (`queued: true`). O processamento
+   * efectivo é assíncrono.
+   */
   async handleIncomingMessage(from, text, options = {}) {
     const phone = normalizePhone(from);
     const message = clean(text);
@@ -835,11 +972,227 @@ class InterviewService {
       return { handled: false, reason: 'empty' };
     }
 
+    this._metricIncrement('messagesReceived', {
+      type: isButton ? 'button' : 'text',
+    });
+
+    // Botões/comandos de controlo são semanticamente atómicos.
+    // Se houver texto já acumulado, deixa-o terminar antes de processar
+    // o comando imediato para preservar a ordem.
+    if (this._isImmediateMessage({ message, isButton })) {
+      const existing = this._aggregationBuffers.get(phone);
+      if (existing) {
+        await this._flushAggregationBuffer(phone);
+      }
+
+      return this._handleAggregatedTurn({
+        phone,
+        message,
+        messageId,
+        isButton,
+        repliedToMessageId,
+      });
+    }
+
+    return this._submitToAggregator({
+      phone,
+      message,
+      messageId,
+      isButton,
+      repliedToMessageId,
+    });
+  }
+
+  // ===========================================================================
+  // [FIX-AGGREGATION-1] AGREGAÇÃO DE MENSAGENS CONSECUTIVAS
+  // ===========================================================================
+
+  /**
+   * Entrega uma mensagem ao buffer de agregação por telefone.
+   *
+   * - Se não há buffer: cria um, adiciona a mensagem, agenda o timer
+   *   com `aggregationWindowMs`.
+   * - Se há buffer: cancela o timer, adiciona a mensagem, agenda um
+   *   novo timer com `aggregationWindowMs`. Reinicia a janela.
+   * - Se o buffer exceder `aggregationMaxMessages`, `aggregationMaxChars`
+   *   ou `aggregationMaxWaitMs`, agenda o flush imediatamente.
+   *
+   * Devolve uma Promise que resolve quando o flush termina (com o
+   * resultado do pipeline). O caller HTTP/bot recebe `queued: true`
+   * antes do flush terminar — a Promise é resolvida no flush.
+   */
+  _submitToAggregator({
+    phone,
+    message,
+    messageId,
+    isButton,
+    repliedToMessageId,
+  }) {
+    const buffer = this._aggregationBuffers.get(phone) || {
+      messages: [],
+      ids: [],
+      replies: [],
+      buttons: [],
+      firstAt: Date.now(),
+      timer: null,
+      flushing: false,
+    };
+
+    buffer.messages.push(message);
+    if (messageId) buffer.ids.push(messageId);
+    buffer.replies.push(repliedToMessageId);
+    buffer.buttons.push(Boolean(isButton));
+
+    // Verificar se deve forçar flush.
+    const elapsed = Date.now() - buffer.firstAt;
+    const totalChars = buffer.messages.join('\n').length;
+    const forceFlush =
+      buffer.messages.length >= CONFIG.aggregationMaxMessages ||
+      totalChars >= CONFIG.aggregationMaxChars ||
+      elapsed >= CONFIG.aggregationMaxWaitMs;
+
+    // Cancelar timer anterior (se houver).
+    if (buffer.timer) {
+      clearTimeout(buffer.timer);
+      buffer.timer = null;
+    }
+
+    this._aggregationBuffers.set(phone, buffer);
+
+    const elapsedAfterInsert = Date.now() - buffer.firstAt;
+    const fastFlush = /[.!?…]$/.test(message);
+    const quietWindow = fastFlush
+      ? Math.min(CONFIG.aggregationFastWindowMs, CONFIG.aggregationWindowMs)
+      : CONFIG.aggregationWindowMs;
+
+    // O limite máximo é contado desde a primeira mensagem. Se o candidato
+    // continua a escrever, o último timer não pode ultrapassá-lo.
+    const remainingMaxWait = Math.max(
+      0,
+      CONFIG.aggregationMaxWaitMs - elapsedAfterInsert
+    );
+
+    const delay = forceFlush
+      ? 0
+      : Math.min(quietWindow, remainingMaxWait);
+
+    this.logDebug('Mensagem adicionada ao buffer de agregação.', phone, {
+      count: buffer.messages.length,
+      totalChars,
+      forceFlush,
+      elapsedMs: elapsed,
+    });
+
+    this._metricIncrement('turnsTotal', {
+      status: forceFlush
+        ? 'aggregation_forced'
+        : 'aggregation_buffered',
+    });
+
+    return new Promise((resolve) => {
+      buffer.timer = setTimeout(() => {
+        buffer.timer = null;
+        this._flushAggregationBuffer(phone)
+          .then(resolve)
+          .catch((error) => {
+            this.logError(
+              'Falha ao processar buffer agregado.',
+              error,
+              phone
+            );
+            resolve({
+              handled: true,
+              queued: false,
+              reason: 'aggregation_flush_error',
+            });
+          });
+      }, delay);
+
+      this._unrefTimer(buffer.timer);
+    });
+  }
+
+  /**
+   * Processa o buffer acumulado como um único turno.
+   *
+   * Reaproveita o pipeline normal (`_handleAggregatedTurn`), que é
+   * idêntico ao `handleIncomingMessage` da versão anterior.
+   */
+  async _flushAggregationBuffer(phone) {
+    const buffer = this._aggregationBuffers.get(phone);
+    if (!buffer || buffer.flushing) {
+      return { handled: false, reason: 'aggregation_empty' };
+    }
+
+    buffer.flushing = true;
+    this._aggregationBuffers.delete(phone);
+
+    const combined = buffer.messages
+      .map((m) => clean(m))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+
+    if (!combined) {
+      buffer.flushing = false;
+      return { handled: false, reason: 'aggregation_empty' };
+    }
+
+    // A última mensagem carrega a identidade de dedup. Se o candidato
+    // envia 3 mensagens e a última é duplicada de um turno anterior,
+    // o dedupe protege-nos.
+    const lastMessageId =
+      buffer.ids[buffer.ids.length - 1] || null;
+
+    const isButton = buffer.buttons.some(Boolean);
+
+    const repliedToMessageId =
+      buffer.replies.find((r) => Boolean(r)) || null;
+
+    this.log('Buffer de agregação fechado.', phone, {
+      messageCount: buffer.messages.length,
+      chars: combined.length,
+      elapsedMs: Date.now() - buffer.firstAt,
+    });
+
+    this._metricIncrement('turnsTotal', { status: 'aggregated' });
+    this._metricSet(
+      'queueDepth',
+      buffer.messages.length,
+      { kind: 'aggregation' }
+    );
+
+    try {
+      return await this._handleAggregatedTurn({
+        phone,
+        message: combined,
+        messageId: lastMessageId,
+        isButton,
+        repliedToMessageId,
+      });
+    } finally {
+      buffer.flushing = false;
+    }
+  }
+
+  /**
+   * Pipeline normal de turno.
+   *
+   * Este método é o `handleIncomingMessage` original, extraído para
+   * ser chamado tanto directo (recovery) como a partir do agregador.
+   */
+  async _handleAggregatedTurn({
+    phone,
+    message,
+    messageId,
+    isButton,
+    repliedToMessageId,
+  }) {
     if (!this._isRedisAvailable()) {
       this._metricIncrement('errorsTotal', { subsystem: 'redis' });
 
       this.logError(
-        'Redis indisponível — mensagem não processável.',
+        'Redis indisponível — mensagem agregada não processável.',
         new Error('redis_unavailable'),
         phone,
         { msgId: messageId }
@@ -887,7 +1240,7 @@ class InterviewService {
       this._metricIncrement('errorsTotal', { subsystem: 'redis' });
 
       this.logError(
-        'Erro ao executar mensagem sob lock.',
+        'Erro ao executar turno agregado sob lock.',
         error,
         phone,
         { msgId: messageId }
@@ -920,6 +1273,33 @@ class InterviewService {
       queued: false,
       reason: 'queue_unavailable',
     };
+  }
+
+  /**
+   * Limpa o buffer de agregação de um telefone.
+   *
+   * Não é chamado durante o pipeline normal — só em `startInterview`
+   * (novo convite) e em `close()` (shutdown).
+   */
+  _clearAggregationBuffer(phone) {
+    const normalized = normalizePhone(phone);
+    if (!normalized) return;
+
+    const buffer = this._aggregationBuffers.get(normalized);
+    if (!buffer) return;
+
+    if (buffer.timer) clearTimeout(buffer.timer);
+    this._aggregationBuffers.delete(normalized);
+  }
+
+  /**
+   * Limpa TODOS os buffers de agregação. Chamado em `close()`.
+   */
+  _clearAllAggregationBuffers() {
+    for (const [, buffer] of this._aggregationBuffers) {
+      if (buffer.timer) clearTimeout(buffer.timer);
+    }
+    this._aggregationBuffers.clear();
   }
 
   async _handleDedupe(phone, messageId) {
@@ -1045,15 +1425,23 @@ class InterviewService {
     }
 
     const interviewId = resolution.interviewId;
+    const effectiveMessage =
+      resolution.effectiveMessage !== undefined
+        ? resolution.effectiveMessage
+        : message;
+    const effectiveMessageId =
+      resolution.effectiveMessageId || messageId;
+    const effectiveTurnId =
+      resolution.effectiveTurnId || turnId;
     let turn;
 
     try {
       turn = await this._sendInterviewTurn({
         interviewId,
         phone,
-        message,
-        messageId,
-        turnId,
+        message: effectiveMessage,
+        messageId: effectiveMessageId,
+        turnId: effectiveTurnId,
         isButton,
       });
     } catch (error) {
@@ -1069,10 +1457,10 @@ class InterviewService {
 
       const queued = await this._queueIncomingTurn({
         phone,
-        message,
-        messageId,
+        message: effectiveMessage,
+        messageId: effectiveMessageId,
         isButton,
-        turnId,
+        turnId: effectiveTurnId,
         interviewId,
         repliedToMessageId,
         reason: 'backend_error',
@@ -1113,21 +1501,8 @@ class InterviewService {
       repliedToMessageId = null,
     }
   ) {
-    // 0) Atalho local — a chave escrita por startInterview.
-    //    É O(1), nunca falha se o mapping existe, e é a razão
-    //    pela qual o bot consegue responder imediatamente após o
-    //    convite. Sem isto, perdíamos a entrevista e caíamos no
-    //    backend, que podia não conhecer o mapping ainda.
-    const localId = await this.resolveInterviewId(phone);
-    if (localId) {
-      return {
-        status: 'found',
-        interviewId: localId,
-        resolvedBy: 'local',
-      };
-    }
-
-    // 1) Disambiguação pendente tem prioridade absoluta.
+    // 0) Disambiguação pendente tem prioridade absoluta.
+    // Um mapping local antigo não pode engolir a escolha "1", "2", etc.
     const pendingDisambiguation = await this._getDisambiguationState(phone);
 
     if (pendingDisambiguation) {
@@ -1138,7 +1513,6 @@ class InterviewService {
       if (chosen) {
         await this._clearDisambiguationState(phone);
         await this._rememberResolvedInterview(phone, chosen.interview_id);
-        // Fixar também no mapping principal para próximos turnos.
         await this.rememberInterview(phone, chosen.interview_id);
 
         this._metricIncrement('turnsTotal', {
@@ -1149,12 +1523,27 @@ class InterviewService {
           status: 'found',
           interviewId: chosen.interview_id,
           resolvedBy: 'disambiguation',
+          effectiveMessage: pendingDisambiguation.originalMessage || message,
+          effectiveMessageId:
+            pendingDisambiguation.originalMessageId || messageId,
+          effectiveTurnId:
+            pendingDisambiguation.originalTurnId || turnId,
         };
       }
 
       return {
         status: 'disambiguation_invalid',
         candidates: pendingDisambiguation.candidates,
+      };
+    }
+
+    // 1) Atalho local — a chave escrita por startInterview.
+    const localId = await this.resolveInterviewId(phone);
+    if (localId) {
+      return {
+        status: 'found',
+        interviewId: localId,
+        resolvedBy: 'local',
       };
     }
 
@@ -1237,7 +1626,6 @@ class InterviewService {
       resolution.interview_id
     ) {
       await this._rememberResolvedInterview(phone, resolution.interview_id);
-      // Fixar também no mapping principal para próximos turnos.
       await this.rememberInterview(phone, resolution.interview_id);
 
       this._metricIncrement('turnsTotal', {
@@ -1364,6 +1752,10 @@ class InterviewService {
       await this.forgetInterview(phone);
       await this._clearResolvedInterview(phone);
       await this._clearDisambiguationState(phone);
+      // [FIX-AGGREGATION-1] Limpar qualquer buffer pendente. Se o
+      // candidato escreveu algo enquanto o backend processava o
+      // último turno, esse buffer já não faz sentido.
+      this._clearAggregationBuffer(phone);
 
       this._metricIncrement('interviewsFinished', {
         status: interviewStatus,
@@ -1535,6 +1927,11 @@ class InterviewService {
           kind: payload?.kind || 'turn',
           reason: payload?.queueReason || 'unknown',
         });
+
+        // Não esperar pelo próximo tick de 5s do worker. O item já está
+        // persistido e pode ser processado imediatamente se o sistema
+        // estiver saudável.
+        this._triggerWorker();
       }
 
       if (result === 0) {
@@ -1705,18 +2102,39 @@ class InterviewService {
 
       this._metricSet('queueDepth', phones.length, { kind: 'batch' });
 
-      for (const phone of phones) {
-        if (this._closing) break;
+      for (
+        let offset = 0;
+        offset < phones.length && !this._closing;
+        offset += CONFIG.workerConcurrency
+      ) {
+        const batch = phones.slice(
+          offset,
+          offset + CONFIG.workerConcurrency
+        );
 
-        try {
-          await this._processPhoneQueue(phone);
-        } catch (error) {
-          this.logError(
-            'Falha ao processar fila do telefone.',
-            error,
-            phone
-          );
-        }
+        const results = await Promise.allSettled(
+          batch.map(async (phone) => {
+            try {
+              await this._processPhoneQueue(phone);
+              return true;
+            } catch (error) {
+              this.logError(
+                'Falha ao processar fila do telefone.',
+                error,
+                phone
+              );
+              return false;
+            }
+          })
+        );
+
+        this._metricIncrement('workerBatches', {
+          size: String(batch.length),
+          failures: String(
+            results.filter((item) => item.status === 'fulfilled' && item.value === false).length +
+            results.filter((item) => item.status === 'rejected').length
+          ),
+        });
       }
     } finally {
       this._workerRunning = false;
@@ -2012,8 +2430,30 @@ class InterviewService {
             await this.rememberInterview(phone, interviewId);
             await this._rememberResolvedInterview(phone, interviewId);
           } else if (confidence === 'ambiguous') {
+            const candidates = Array.isArray(resolution?.candidates)
+              ? resolution.candidates
+              : [];
+
+            if (candidates.length) {
+              await this._storeDisambiguationState(phone, {
+                candidates,
+                originalMessage: message,
+                originalMessageId: messageId,
+                originalTurnId: turnId,
+              });
+
+              await this._sendDisambiguationPrompt(phone, candidates);
+
+              this._metricIncrement('turnsTotal', {
+                status: 'recovered_routing_ambiguous',
+                candidateCount: String(candidates.length),
+              });
+
+              return { action: 'ack' };
+            }
+
             this.logWarn(
-              'Turno recuperado caiu em routing ambíguo — a reportar órfã.',
+              'Turno recuperado caiu em routing ambíguo sem candidatos.',
               phone,
               { turnId }
             );
@@ -2183,6 +2623,9 @@ class InterviewService {
       await this.forgetInterview(phone);
       await this._clearResolvedInterview(phone);
       await this._clearDisambiguationState(phone);
+      // [FIX-AGGREGATION-1] Limpar buffer pendente também na conclusão
+      // de turno recuperado.
+      this._clearAggregationBuffer(phone);
 
       this._metricIncrement('interviewsFinished', {
         status: interviewStatus,
@@ -2524,10 +2967,24 @@ class InterviewService {
         }
       }
 
-      const typingDelay = Math.min(
-        text.length * this.typingMsPerChar,
-        this.typingMax
-      );
+      const shouldSimulateLongTyping =
+        text.length >= CONFIG.typingLongMessageThreshold;
+
+      let typingDelay = text.length * this.typingMsPerChar;
+
+      // Mensagens muito curtas precisam de uma pequena pausa humana, mas
+      // não de uma espera artificial proporcional que penalize cada turno.
+      if (!shouldSimulateLongTyping) {
+        typingDelay = Math.min(
+          Math.max(typingDelay, this.typingMin),
+          420
+        );
+      } else {
+        typingDelay = Math.min(
+          Math.max(typingDelay, this.typingMin),
+          this.typingMax
+        );
+      }
 
       if (typingDelay > 0) {
         await this.delay(typingDelay);
@@ -2613,8 +3070,15 @@ class InterviewService {
   // ===========================================================================
 
   _extractBubbles(bubbles) {
+    if (typeof bubbles === 'string') {
+      return this.splitBubbles(bubbles);
+    }
+
     if (!Array.isArray(bubbles)) return [];
-    return bubbles.map(clean).filter(Boolean);
+
+    return bubbles
+      .map(clean)
+      .filter(Boolean);
   }
 
   splitBubbles(text) {
