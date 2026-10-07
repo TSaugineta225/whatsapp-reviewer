@@ -120,19 +120,57 @@ app.post('/send-message', async (req, res) => {
 // ============================================================
 // STATUS
 // ============================================================
+//
+// [FIX-QR-DASHBOARD]
+//   Antes, este endpoint devolvia apenas:
+//
+//       { whatsapp: { connected, qr_code, ... }, redis, uptime_seconds }
+//
+//   O proxy Python (admin.py) reenviava esse objecto tal-e-qual, e o
+//   React lia `data.connected` / `data.qr_code` no topo — que não
+//   existiam. Resultado: o QR Code nunca aparecia no dashboard,
+//   independentemente de estar disponível no bot.
+//
+//   Agora devolvemos o status do WhatsApp **flat** (chaves no topo) e
+//   mantemos também o objecto `whatsapp` aninhado para compatibilidade
+//   com eventuais consumidores antigos.
 
 app.get('/status', (req, res) => {
   try {
+    const whatsappStatus = whatsappService.getStatus();
+
     res.json({
-      whatsapp: whatsappService.getStatus(),
+      // Flat — o que o AdminDashboard.jsx espera.
+      connected: whatsappStatus.connected,
+      ready: whatsappStatus.ready,
+      connecting: whatsappStatus.connecting,
+      qr_code: whatsappStatus.qr_code,
+      session: whatsappStatus.session,
+      connected_at: whatsappStatus.connected_at,
+      retry_count: whatsappStatus.retry_count,
+      recovery_scheduled: whatsappStatus.recovery_scheduled,
+      message: whatsappStatus.message,
+
+      // Compatibilidade: alguns consumidores antigos liam `.whatsapp`.
+      whatsapp: whatsappStatus,
+
       redis: {
         ready: redis.isReady,
         url: redis.url,
       },
+
       uptime_seconds: Math.floor(process.uptime()),
     });
   } catch (error) {
+    console.error('[BOT] /status falhou:', error);
+
     res.status(500).json({
+      connected: false,
+      ready: false,
+      connecting: false,
+      qr_code: null,
+      session: null,
+      message: 'Erro ao obter status do WhatsApp.',
       whatsapp: { connected: false, message: 'Erro ao obter status' },
       redis: { ready: false },
     });
