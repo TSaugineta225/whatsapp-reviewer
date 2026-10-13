@@ -1,14 +1,39 @@
-# docker-compose.yml
-version: "3.9"
+# docker-compose.yml — versão Windows
+#
+# CENÁRIO ACTUAL
+#   - Docker:        redis, bot
+#   - Windows host:  Backend Python (localhost:8000)
+#   - Inactivos:     caddy, redis-exporter, prometheus, alertmanager, grafana
+#
+# COMO USAR
+#   Subir só o essencial:    docker compose up -d redis bot
+#   Ver logs:                docker compose logs -f bot
+#   Subir monitoring:        docker compose up -d redis bot redis-exporter prometheus alertmanager grafana
+#   Subir caddy:             docker compose up -d redis bot caddy
+#   Parar tudo:              docker compose down
+#
+# REFACTOR ENV (Node)
+#   O bot agora lê a configuração de `src/config/env.js`, que:
+#     - Carrega o `.env` no arranque.
+#     - Valida as variáveis conforme NODE_ENV.
+#     - Aborta em produção se algo crítico faltar.
+#
+#   Este compose passa todas as variáveis relevantes ao container
+#   (o `.env` não é copiado para dentro da imagem — está no
+#   `.dockerignore`).
 
 # ============================================================
 # REDES
 # ============================================================
 
 networks:
+  # Rede isolada — sem acesso à internet, só entre containers.
+  # Usada pelo redis + redis-exporter + prometheus + alertmanager.
   internal:
     driver: bridge
-    internal: true     # sem acesso à internet — só entre containers
+    internal: true
+
+  # Rede com acesso à internet — usada pelo bot (rota default) e caddy.
   public:
     driver: bridge
 
@@ -17,12 +42,15 @@ networks:
 # ============================================================
 
 volumes:
+  # [WINDOWS] bind mount relativo ao projecto.
+  # Docker Desktop (WSL2 backend) traduz automaticamente.
   auth_info:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: /var/lib/yane-bot/auth_info
+      device: ./auth_info
+
   redis_data:
     driver: local
   prometheus_data:
@@ -43,13 +71,12 @@ volumes:
 services:
 
   # ----------------------------------------------------------
-  # REDIS
+  # REDIS — serviço em Docker (simula Memorystore em produção)
   # ----------------------------------------------------------
   redis:
     image: redis:7.2-alpine
     container_name: yane-redis
     restart: unless-stopped
-
     command:
       - "redis-server"
       - "--appendonly"
@@ -70,29 +97,18 @@ services:
       - "${REDIS_PASSWORD:?REDIS_PASSWORD é obrigatório}"
       - "--protected-mode"
       - "yes"
-
     environment:
       TZ: Africa/Maputo
-
     volumes:
       - redis_data:/data
-
     networks:
       - internal
-
     healthcheck:
-      test:
-        - "CMD"
-        - "redis-cli"
-        - "-a"
-        - "${REDIS_PASSWORD}"
-        - "--no-auth-warning"
-        - "ping"
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 5s
-
     deploy:
       resources:
         limits:
@@ -101,18 +117,16 @@ services:
         reservations:
           cpus: "0.25"
           memory: 128M
-
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
     security_opt:
       - no-new-privileges:true
 
   # ----------------------------------------------------------
-  # BOT
+  # BOT — aplicação principal
   # ----------------------------------------------------------
   bot:
     build:
@@ -129,24 +143,45 @@ services:
       redis:
         condition: service_healthy
 
+    # Permite ao container alcançar serviços no Windows host
+    # (ex: backend Python em localhost:8000)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     environment:
-      NODE_ENV: production
+      # ─── Ambiente ───
+      NODE_ENV: "${NODE_ENV:-production}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
       PORT: "3000"
       TZ: Africa/Maputo
 
-      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
-      REDIS_PREFIX: "yane"
+      # ─── Bind do bot no host ───
+      BOT_BIND_HOST: "${BOT_BIND_HOST:-127.0.0.1}"
 
+      # ─── Redis (serviço do compose — resolve por DNS interno) ───
+      REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD é obrigatório}@redis:6379/0"
+      REDIS_PREFIX: "${REDIS_PREFIX:-yane}"
+
+      # ─── API Python ───
       YANE_API_URL: "${YANE_API_URL:?YANE_API_URL é obrigatório}"
       YANE_SERVICE_TOKEN: "${YANE_SERVICE_TOKEN:?YANE_SERVICE_TOKEN é obrigatório}"
-      YANE_API_TIMEOUT: "15000"
+      YANE_API_KEY: "${YANE_API_KEY:-}"
+      YANE_API_TIMEOUT: "${YANE_API_TIMEOUT:-15000}"
+      YANE_TURN_TIMEOUT: "${YANE_TURN_TIMEOUT:-300000}"
+      YANE_LOOKUP_TIMEOUT: "${YANE_LOOKUP_TIMEOUT:-10000}"
+      YANE_STATUS_TIMEOUT: "${YANE_STATUS_TIMEOUT:-5000}"
+      YANE_HEALTH_TIMEOUT: "${YANE_HEALTH_TIMEOUT:-3000}"
 
-      DEFAULT_COUNTRY_CODE: "258"
-      WHATSAPP_TYPING_MS_PER_CHAR: "22"
-      WHATSAPP_TYPING_MAX_MS: "2600"
+      # ─── Bot / WhatsApp ───
+      WHATSAPP_BOT_SECRET: "${WHATSAPP_BOT_SECRET:-}"
+      DEFAULT_COUNTRY_CODE: "${DEFAULT_COUNTRY_CODE:-258}"
+      WHATSAPP_TYPING_MS_PER_CHAR: "${WHATSAPP_TYPING_MS_PER_CHAR:-22}"
+      WHATSAPP_TYPING_MAX_MS: "${WHATSAPP_TYPING_MAX_MS:-2600}"
 
+      # ─── Métricas ───
       METRICS_TOKEN: "${METRICS_TOKEN:-}"
 
+      # ─── Node ───
       NODE_OPTIONS: "--max-old-space-size=768"
 
     volumes:
@@ -156,9 +191,11 @@ services:
     ports:
       - "${BOT_BIND_HOST:-127.0.0.1}:${BOT_BIND_PORT:-3000}:3000"
 
+    # Ordem importa: `public` primeiro (rota default com internet);
+    # `internal` depois (para falar com redis/redis-exporter).
     networks:
-      - internal
       - public
+      - internal
 
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
@@ -190,7 +227,7 @@ services:
       - NET_BIND_SERVICE
 
   # ----------------------------------------------------------
-  # CADDY (reverse proxy opcional)
+  # CADDY — reverse proxy (só quando expuseres publicamente)
   # ----------------------------------------------------------
   caddy:
     image: caddy:2-alpine
@@ -207,6 +244,7 @@ services:
       - ./logs/caddy:/var/log/caddy
     networks:
       - public
+      - internal
     depends_on:
       bot:
         condition: service_healthy
@@ -224,7 +262,7 @@ services:
       - no-new-privileges:true
 
   # ----------------------------------------------------------
-  # REDIS EXPORTER
+  # REDIS EXPORTER — métricas do Redis para o Prometheus
   # ----------------------------------------------------------
   redis-exporter:
     image: oliver006/redis_exporter:v1.66.0-alpine
@@ -349,6 +387,7 @@ services:
       - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
     networks:
       - internal
+      - public
     depends_on:
       - prometheus
     deploy:

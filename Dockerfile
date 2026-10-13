@@ -1,4 +1,4 @@
-# Dockerfile
+# syntax=docker/dockerfile:1.6
 
 # ============================================================
 # STAGE 1 — dependências de produção
@@ -7,10 +7,10 @@ FROM node:20-alpine AS deps
 
 WORKDIR /app
 
-# Instalar apenas prod deps
+
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev --no-audit --no-fund && \
-    npm cache clean --force
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --no-audit --no-fund
 
 # ============================================================
 # STAGE 2 — runtime
@@ -27,13 +27,13 @@ RUN addgroup -g 1001 -S nodejs && \
 
 WORKDIR /app
 
-# Copiar deps do stage anterior
-COPY --from=deps /app/node_modules ./node_modules
+# Copiar deps do stage anterior, com owner correcto.
+COPY --from=deps --chown=nodejs:nodejs /app/node_modules ./node_modules
 
 # Copiar código com owner correcto
 COPY --chown=nodejs:nodejs . .
 
-# Diretórios persistentes (serão volumes)
+# Diretórios persistentes (serão volumes em runtime).
 RUN mkdir -p /app/auth_info /app/logs && \
     chown -R nodejs:nodejs /app/auth_info /app/logs
 
@@ -46,7 +46,7 @@ ENV NODE_ENV=production \
 
 EXPOSE 3000
 
-# Healthcheck nativo
+# Healthcheck nativo (usado se correres sem docker-compose)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
   CMD curl -fsS http://localhost:3000/health || exit 1
 

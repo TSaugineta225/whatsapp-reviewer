@@ -1,0 +1,9 @@
+
+# 1. Build (só na 1ª vez ou quando mudas código)
+docker compose build bot
+
+# 2. INICIAR redis + bot em background
+docker compose up -d redis bot
+
+# 3. VER logs (depois de estar a correr)
+docker compose logs -f bot

@@ -18,14 +18,33 @@
 //   cancelInterview devolve { success: true, skipped: true } quando
 //   o endpoint não existe, em vez de lançar. O !reset do candidato
 //   deixa de partir.
+//
+// [ENV-REFACTOR]
+//   Antes, este serviço lia `process.env.*` directamente no constructor.
+//   Isso significava que, se o `.env` não estivesse carregado quando o
+//   `require('./services/yane-integration.service')` corresse, todos os
+//   campos ficavam com os defaults (bug silencioso em dev local fora
+//   de Docker).
+//
+//   Agora tudo vem de `env` (src/config/env.js), que:
+//     - Carrega o `.env` no topo da cadeia de requires.
+//     - Valida as variáveis conforme NODE_ENV.
+//     - Congela os valores.
+//     - Falha no arranque se algo crítico faltar em produção.
+//
+//   O resto do ficheiro (request, _createHttpError, sendInterviewTurn,
+//   resolveInboundMessage, cancelInterview, etc.) mantém-se INTACTO.
 
 'use strict';
 
 const { randomUUID } = require('crypto');
 const pino = require('pino');
 const BaseService = require('./base.service');
+const env = require('../config/env');
 
-const DEFAULT_API_URL = 'http://localhost:8000/api';
+// =============================================================================
+// CONSTANTES
+// =============================================================================
 
 const DEFAULT_TIMEOUTS = Object.freeze({
   default: 15_000,
@@ -328,13 +347,24 @@ class YaneIntegrationService extends BaseService {
   constructor(options = {}) {
     super();
 
-    this.yaneApiUrl = normalizeUrl(
-      process.env.YANE_API_URL ||
-      DEFAULT_API_URL
-    );
+    // =========================================================================
+    // CONFIGURAÇÃO — [ENV-REFACTOR]
+    // =========================================================================
+    //
+    // Todos os valores vêm de `env` (src/config/env.js), que:
+    //   - Carregou o `.env` no arranque (antes deste módulo).
+    //   - Validou NODE_ENV, URLs, tokens.
+    //   - Congelou os valores.
+    //
+    // Deixámos de usar `process.env.*` directamente no constructor,
+    // porque isso dependia de o `.env` já estar carregado — o que
+    // não acontecia em dev local fora de Docker.
+    // =========================================================================
+
+    this.yaneApiUrl = normalizeUrl(env.yane.apiUrl);
 
     this.defaultTimeoutMs = toPositiveNumber(
-      process.env.YANE_API_TIMEOUT,
+      env.yane.apiTimeoutMs,
       DEFAULT_TIMEOUTS.default
     );
 
@@ -342,33 +372,38 @@ class YaneIntegrationService extends BaseService {
       default: this.defaultTimeoutMs,
 
       turn: toPositiveNumber(
-        process.env.YANE_TURN_TIMEOUT,
+        env.yane.turnTimeoutMs,
         DEFAULT_TIMEOUTS.turn
       ),
 
       lookup: toPositiveNumber(
-        process.env.YANE_LOOKUP_TIMEOUT,
+        env.yane.lookupTimeoutMs,
         DEFAULT_TIMEOUTS.lookup
       ),
 
       status: toPositiveNumber(
-        process.env.YANE_STATUS_TIMEOUT,
+        env.yane.statusTimeoutMs,
         DEFAULT_TIMEOUTS.status
       ),
 
       health: toPositiveNumber(
-        process.env.YANE_HEALTH_TIMEOUT,
+        env.yane.healthTimeoutMs,
         DEFAULT_TIMEOUTS.health
       ),
     });
 
+    // Token de autenticação: YANE_SERVICE_TOKEN tem prioridade;
+    // YANE_API_KEY é aceite como fallback (alguns backends usam
+    // X-API-Key em vez de Bearer).
     this.serviceToken =
-      clean(process.env.YANE_SERVICE_TOKEN) ||
-      clean(process.env.YANE_API_KEY) ||
+      env.yane.serviceToken ||
+      env.yane.apiKey ||
       null;
 
+    // Secret do bot: preferir WHATSAPP_BOT_SECRET, cair para
+    // serviceToken se não existir (comportamento antigo).
     this.botSecret =
-      clean(process.env.WHATSAPP_BOT_SECRET) ||
+      env.whatsapp.botSecret ||
       this.serviceToken;
 
     this.fetch =
@@ -378,8 +413,7 @@ class YaneIntegrationService extends BaseService {
     this.logger =
       options.logger ||
       pino({
-        level:
-          process.env.LOG_LEVEL || 'info',
+        level: env.logging.level,
         base: {
           service: 'yane-integration',
         },
@@ -413,6 +447,7 @@ class YaneIntegrationService extends BaseService {
       'YaneIntegrationService inicializado.',
       {
         baseUrl: this.yaneApiUrl,
+        environment: env.nodeEnv,
         authenticated:
           Boolean(this.serviceToken),
         botSecretConfigured:

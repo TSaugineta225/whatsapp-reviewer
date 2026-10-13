@@ -1,6 +1,20 @@
 // src/app.js
+//
+// [ENV-REFACTOR]
+//   - Removido `dotenv.config()` (passa a estar no `config/env.js`,
+//     que corre antes de qualquer service importar `process.env`).
+//   - `requireServiceToken` usa `env.yane.serviceToken`.
+//   - `METRICS_TOKEN` vem de `env.metrics.token`.
+//   - `console.log`/`console.error` substituídos por `logger` pino
+//     para logs estruturados (mantendo o comportamento).
+
+'use strict';
+
+// IMPORTANTE: primeiro require — carrega o .env e valida-o.
+const env = require('./config/env');
+
 const express = require('express');
-const dotenv = require('dotenv');
+const pino = require('pino');
 
 const errorHandler = require('./middleware/error.middleware');
 const routes = require('./routes');
@@ -11,18 +25,15 @@ const WhatsAppService = require('./services/whatsapp.service');
 const YaneIntegrationService = require('./services/yane-integration.service');
 const metrics = require('./services/metrics.service');
 
-dotenv.config();
+// Logger principal do bot. Nível controlado por LOG_LEVEL.
+const logger = pino({
+  level: env.logging.level,
+  base: { service: 'bot' },
+});
 
 // ============================================================
 // SERVIÇOS
 // ============================================================
-//
-// Ordem importa:
-//   1. Redis              → infraestrutura partilhada
-//   2. InterviewService   → usa Redis
-//   3. WhatsAppService    → usa InterviewService + Redis
-//   4. YaneIntegration    → HTTP puro
-//   5. Metrics            → instrumenta todos
 
 const redis = new RedisService();
 
@@ -35,6 +46,39 @@ global.whatsappService = whatsappService;
 global.interviewService = interviewService;
 global.yaneIntegration = yaneIntegration;
 global.redisService = redis;
+
+// ============================================================
+// MIDDLEWARE — autenticação de serviço
+// ============================================================
+//
+// [SEC-PROD] Endpoints sensíveis protegidos por bearer token.
+//
+//   Authorization: Bearer <YANE_SERVICE_TOKEN>
+//
+// Se `env.yane.serviceToken` estiver vazio:
+//   - em dev:     deixa passar (útil para testes manuais).
+//   - em prod:    o `env.js` já abortou o arranque, portanto isto
+//                 nunca chega a correr sem token em produção.
+
+function requireServiceToken(req, res, next) {
+  const expected = env.yane.serviceToken;
+
+  if (!expected) {
+    return next();
+  }
+
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+
+  if (!token || token !== expected) {
+    return res.status(401).json({
+      success: false,
+      message: 'Unauthorized',
+    });
+  }
+
+  return next();
+}
 
 // ============================================================
 // APP
@@ -51,7 +95,7 @@ app.use('/', routes);
 // START INTERVIEW — chamado pelo backend Python após invite
 // ============================================================
 
-app.post('/start-interview', async (req, res) => {
+app.post('/start-interview', requireServiceToken, async (req, res) => {
   try {
     const result = await interviewService.startInterview(req.body);
 
@@ -61,7 +105,7 @@ app.post('/start-interview', async (req, res) => {
 
     return res.json(result);
   } catch (error) {
-    console.error('[BOT] /start-interview falhou:', error);
+    logger.error({ err: error }, '/start-interview falhou');
     return res.status(500).json({
       success: false,
       message: 'Erro ao iniciar entrevista.',
@@ -74,7 +118,7 @@ app.post('/start-interview', async (req, res) => {
 // SEND MESSAGE — notificações avulsas
 // ============================================================
 
-app.post('/send-message', async (req, res) => {
+app.post('/send-message', requireServiceToken, async (req, res) => {
   try {
     const { to, message } = req.body;
 
@@ -95,7 +139,7 @@ app.post('/send-message', async (req, res) => {
     const preview =
       message.length > 50 ? `${message.substring(0, 50)}...` : message;
 
-    console.log(`[BOT] A enviar mensagem para ${to}: "${preview}"`);
+    logger.info({ to: `${to.slice(0, 6)}***`, preview }, 'A enviar mensagem');
 
     const sent = await whatsappService.sendMessage(to, message);
 
@@ -108,7 +152,7 @@ app.post('/send-message', async (req, res) => {
 
     return res.json({ success: true, to });
   } catch (error) {
-    console.error('[BOT] /send-message falhou:', error);
+    logger.error({ err: error }, '/send-message falhou');
     return res.status(500).json({
       success: false,
       message: 'Erro interno ao enviar mensagem.',
@@ -121,26 +165,14 @@ app.post('/send-message', async (req, res) => {
 // STATUS
 // ============================================================
 //
-// [FIX-QR-DASHBOARD]
-//   Antes, este endpoint devolvia apenas:
-//
-//       { whatsapp: { connected, qr_code, ... }, redis, uptime_seconds }
-//
-//   O proxy Python (admin.py) reenviava esse objecto tal-e-qual, e o
-//   React lia `data.connected` / `data.qr_code` no topo — que não
-//   existiam. Resultado: o QR Code nunca aparecia no dashboard,
-//   independentemente de estar disponível no bot.
-//
-//   Agora devolvemos o status do WhatsApp **flat** (chaves no topo) e
-//   mantemos também o objecto `whatsapp` aninhado para compatibilidade
-//   com eventuais consumidores antigos.
+// [FIX-QR-DASHBOARD] — devolve status flat (chaves no topo) para o
+// React + objecto `whatsapp` aninhado para compatibilidade.
 
 app.get('/status', (req, res) => {
   try {
     const whatsappStatus = whatsappService.getStatus();
 
     res.json({
-      // Flat — o que o AdminDashboard.jsx espera.
       connected: whatsappStatus.connected,
       ready: whatsappStatus.ready,
       connecting: whatsappStatus.connecting,
@@ -150,19 +182,15 @@ app.get('/status', (req, res) => {
       retry_count: whatsappStatus.retry_count,
       recovery_scheduled: whatsappStatus.recovery_scheduled,
       message: whatsappStatus.message,
-
-      // Compatibilidade: alguns consumidores antigos liam `.whatsapp`.
       whatsapp: whatsappStatus,
-
       redis: {
         ready: redis.isReady,
         url: redis.url,
       },
-
       uptime_seconds: Math.floor(process.uptime()),
     });
   } catch (error) {
-    console.error('[BOT] /status falhou:', error);
+    logger.error({ err: error }, '/status falhou');
 
     res.status(500).json({
       connected: false,
@@ -181,7 +209,7 @@ app.get('/status', (req, res) => {
 // RESET WHATSAPP SESSION
 // ============================================================
 
-app.post('/reset', async (req, res) => {
+app.post('/reset', requireServiceToken, async (req, res) => {
   try {
     const result = await whatsappService.resetSession();
     res.json(result);
@@ -210,7 +238,7 @@ app.get('/health', (req, res) => {
 // ============================================================
 
 app.get('/metrics', async (req, res) => {
-  const expected = process.env.METRICS_TOKEN;
+  const expected = env.metrics.token;
 
   if (expected) {
     const auth = req.headers.authorization || '';
@@ -225,7 +253,7 @@ app.get('/metrics', async (req, res) => {
     res.set('Content-Type', metrics.getContentType());
     res.send(await metrics.getMetrics());
   } catch (error) {
-    console.error('[METRICS] Falha ao serializar:', error);
+    logger.error({ err: error }, 'Falha ao serializar métricas');
     res.status(500).send('Metrics unavailable');
   }
 });
@@ -243,4 +271,5 @@ module.exports = {
   whatsappService,
   yaneIntegration,
   metrics,
+  logger,
 };

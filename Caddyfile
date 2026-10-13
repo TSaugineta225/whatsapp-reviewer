@@ -3,16 +3,15 @@
 # Reverse proxy com HTTPS automático (Let's Encrypt).
 #
 # Pré-requisitos:
-#   1. Domínio apontado para este servidor (A record)
+#   1. Domínios apontados para este servidor (A records):
+#        - bot.yane.co.mz      → IP do servidor
+#        - grafana.yane.co.mz  → IP do servidor
 #   2. Portas 80 e 443 abertas
 #   3. Caddy corre no serviço `caddy` do docker-compose
-#
-# Ajusta os domínios abaixo para os teus.
 
 {
     email admin@yane.co.mz
 
-    # Logs
     log {
         output file /var/log/caddy/access.log {
             roll_size 20MB
@@ -41,8 +40,8 @@ bot.yane.co.mz {
     @blocked not method POST GET
     respond @blocked 405
 
-    # Bloquear /reset em produção
-    @reset path /reset
+    # Bloquear /reset em produção (apanha /reset e /reset/*)
+    @reset path /reset /reset/*
     respond @reset 403
 
     # Timeouts
@@ -58,20 +57,19 @@ bot.yane.co.mz {
 # GRAFANA (dashboard de monitoring)
 # ============================================================
 grafana.yane.co.mz {
-    reverse_proxy grafana:3000
+    encode gzip
+
+    # Grafana usa WebSockets — desactivar buffering.
+    # NOTA: só pode existir UM `reverse_proxy` por site block.
+    reverse_proxy grafana:3000 {
+        flush_interval -1
+    }
 
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"
         X-Frame-Options "SAMEORIGIN"
         -Server
-    }
-
-    encode gzip
-
-    # Grafana usa WebSockets — desactivar buffering
-    reverse_proxy {
-        flush_interval -1
     }
 }
 
@@ -81,9 +79,10 @@ grafana.yane.co.mz {
 # prometheus.yane.co.mz {
 #     reverse_proxy prometheus:9090
 #
-#     # Basic auth recomendado
-#     basicauth {
-#         admin $2y$12$hash.gerado.com.htpasswd
+#     # Em Caddy 2.7+ o directivo chama-se `basic_auth`.
+#     # Gerar hash:  docker run --rm caddy:2-alpine caddy hash-password
+#     basic_auth {
+#         admin $2a$14$hash_gerado_com_caddy_hash_password
 #     }
 #
 #     header {
