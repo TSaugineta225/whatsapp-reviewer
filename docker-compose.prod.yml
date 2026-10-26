@@ -1,0 +1,11 @@
+# bot/docker-compose.prod.yml
+#
+# Override de PRODUÇÃO. Aplicado sobre o docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Não é lido automaticamente. Em dev, `docker compose up` continua idêntico.
+
+services:
+  bot:
+    image: "europe-west1-docker.pkg.dev/kaya-475907/yane/yane-bot:${BOT_TAG:?defina BOT_TAG (ex.: 4.5)}"
+    build: null    # ignora o `build:` do base → força pull

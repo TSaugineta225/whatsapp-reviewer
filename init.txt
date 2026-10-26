@@ -1,0 +1,3 @@
+cd bot/
+gcloud builds submit \
+  --tag europe-west1-docker.pkg.dev/kaya-475907/yane/yane-bot:4.5
